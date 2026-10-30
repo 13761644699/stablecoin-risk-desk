@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+// arb_ignite.mjs — 公告点火器（2026-10-30 套利体系整合·补充 A）
+// 用法：node arb_ignite.mjs --source "Binance 公告" --title "<公告标题>" [--url <链接>]
+// 触发场景：公告监控（bn-announce-watch 20:00 轮次或今后任何实时公告通道）抓到
+// 点火类公告（大所安全事件 / 暂停充提等，分类见 ARB_INTEGRATION.md 第 7 节）时，
+// 由公告流程调用本脚本一次。它立即做一次三方比价（DEX 白名单池 vs 币安中间价 vs
+// Chainlink 预言机，覆盖 ETH/WBTC；稳定币侧用 Kraken USD 中间价 vs $1 锚 +
+// 脱锚台当前活跃事件），发现脱节（主流币 ≥150bps / 稳定币 ≥50bps / 已有 severe
+// 脱锚事件）才入队研判（type=ignite, severity=severe）；全部平静则只记
+// state/arb_ignite_log.jsonl，不唤起、不推送——公告本身照常由公告流程推送，
+// 点火只是额外动作。研判时限目标：入队后 10 分钟内产出深化分析（与兜底对齐）。
+// 干跑：ARB_NO_PUSH=1 时队列自动改写 dryrun 文件（arb_lib 统一口径）。
+import fs from 'fs';
+import path from 'path';
+import { STATE_DIR, NO_PUSH, chainlinkPrice, FEEDS, binanceMid, v3PoolState, TOKENS, enqueueArbEvent } from './arb_lib.mjs';
+
+const args = process.argv.slice(2);
+const argOf = (name) => {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 ? args[i + 1] : null;
+};
+const source = argOf('source') || '公告（未注明来源）';
+const title = argOf('title') || '(无标题)';
+const url = argOf('url') || null;
+const now = new Date();
+const bps = (a, b) => (b ? ((a - b) / b) * 10000 : null);
+const fmtBps = (v) => (v === null || v === undefined || !Number.isFinite(v) ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(0)}bps`);
+
+// 白名单池（与 arb_spread_watch 同口径，TVL 已实测）
+const POOLS = {
+  ethUsdc: { pool: '0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640', base: TOKENS.WETH.address, baseDec: 18, quote: TOKENS.USDC.address, quoteDec: 6 },
+  ethUsdt: { pool: '0x4e68ccd3e89f51c3074ca5072bbac773960dfa36', base: TOKENS.WETH.address, baseDec: 18, quote: TOKENS.USDT.address, quoteDec: 6 },
+  wbtcWeth: { pool: '0x4585fe77225b41b697c938b018e2ac67ac5a20c0', base: TOKENS.WBTC.address, baseDec: 8, quote: TOKENS.WETH.address, quoteDec: 18 },
+};
+
+async function krakenMid(altname) {
+  const ap = await (await fetch('https://api.kraken.com/0/public/AssetPairs', { signal: AbortSignal.timeout(8000) })).json();
+  let key = null;
+  for (const [k, v] of Object.entries(ap.result || {})) {
+    if (v.altname === altname && !String(v.altname).includes('.')) { key = k; break; }
+  }
+  if (!key) return null;
+  const tk = await (await fetch(`https://api.kraken.com/0/public/Ticker?pair=${key}`, { signal: AbortSignal.timeout(8000) })).json();
+  const t = tk.result?.[key];
+  const bid = Number(t?.b?.[0]), ask = Number(t?.a?.[0]);
+  return bid > 0 && ask > 0 ? (bid + ask) / 2 : null;
+}
+
+const lines = [];
+const flags = [];
+lines.push(`🔥 公告点火：${source}｜${title}${url ? `｜${url}` : ''}`);
+lines.push(`点火时刻：${now.toISOString()}（北京时间 ${now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}）`);
+lines.push('');
+
+try {
+  const usdtUsd = await krakenMid('USDTUSD').catch(() => null);
+  // ---- ETH 三方 ----
+  const [clEth, bnEth, stEthUsdc, stEthUsdt] = await Promise.all([
+    chainlinkPrice(FEEDS['ETH/USD']).catch(() => null),
+    binanceMid('ETHUSDT').catch(() => null),
+    v3PoolState(POOLS.ethUsdc.pool, POOLS.ethUsdc.base, POOLS.ethUsdc.baseDec, POOLS.ethUsdc.quote, POOLS.ethUsdc.quoteDec).catch(() => null),
+    v3PoolState(POOLS.ethUsdt.pool, POOLS.ethUsdt.base, POOLS.ethUsdt.baseDec, POOLS.ethUsdt.quote, POOLS.ethUsdt.quoteDec).catch(() => null),
+  ]);
+  const dexEth = stEthUsdc?.priceBaseInQuote || (stEthUsdt && usdtUsd ? stEthUsdt.priceBaseInQuote * usdtUsd : null);
+  lines.push(`ETH 三方：DEX $${dexEth?.toFixed(2) ?? '—'}｜币安 $${bnEth?.toFixed(2) ?? '—'}｜Chainlink $${clEth?.price?.toFixed(2) ?? '—'}`);
+  const ethDevO = dexEth && clEth ? bps(dexEth, clEth.price) : null;
+  const ethDevC = dexEth && bnEth ? bps(dexEth, bnEth) : null;
+  lines.push(`  DEX 相对预言机 ${fmtBps(ethDevO)}｜相对币安 ${fmtBps(ethDevC)}`);
+  if ((ethDevO !== null && Math.abs(ethDevO) >= 150) || (ethDevC !== null && Math.abs(ethDevC) >= 150)) {
+    flags.push(`ETH 三方价差越线（对预言机 ${fmtBps(ethDevO)} / 对币安 ${fmtBps(ethDevC)}）`);
+  }
+  // ---- WBTC 三方（全 DEX 口径，避免把 ETH 脱节算入） ----
+  const [clBtc, bnBtc, stWbtc] = await Promise.all([
+    chainlinkPrice(FEEDS['BTC/USD']).catch(() => null),
+    binanceMid('BTCUSDT').catch(() => null),
+    v3PoolState(POOLS.wbtcWeth.pool, POOLS.wbtcWeth.base, POOLS.wbtcWeth.baseDec, POOLS.wbtcWeth.quote, POOLS.wbtcWeth.quoteDec).catch(() => null),
+  ]);
+  const dexBtc = stWbtc && dexEth ? stWbtc.priceBaseInQuote * dexEth : null;
+  lines.push(`WBTC 三方：DEX $${dexBtc?.toFixed(2) ?? '—'}｜币安 $${bnBtc?.toFixed(2) ?? '—'}｜Chainlink $${clBtc?.price?.toFixed(2) ?? '—'}`);
+  const btcDevO = dexBtc && clBtc ? bps(dexBtc, clBtc.price) : null;
+  const btcDevC = dexBtc && bnBtc ? bps(dexBtc, bnBtc) : null;
+  lines.push(`  DEX 相对预言机 ${fmtBps(btcDevO)}｜相对币安 ${fmtBps(btcDevC)}`);
+  if ((btcDevO !== null && Math.abs(btcDevO) >= 150) || (btcDevC !== null && Math.abs(btcDevC) >= 150)) {
+    flags.push(`WBTC 三方价差越线（对预言机 ${fmtBps(btcDevO)} / 对币安 ${fmtBps(btcDevC)}）`);
+  }
+  // ---- 稳定币 CEX 侧（Kraken USD 中间价 vs $1） ----
+  for (const sym of ['USDT', 'USDC', 'PYUSD', 'RLUSD', 'USDG']) {
+    const mid = sym === 'USDT' ? usdtUsd : await krakenMid(`${sym}USD`).catch(() => null);
+    if (mid) {
+      const dev = bps(mid, 1);
+      lines.push(`${sym} Kraken/USD 中间价 $${mid.toFixed(4)}（${fmtBps(dev)}）`);
+      if (Math.abs(dev) >= 50) flags.push(`${sym} CEX 侧偏离 $1 达 ${fmtBps(dev)}`);
+    }
+  }
+  // ---- 脱锚台当前活跃事件（DEX 侧） ----
+  try {
+    const r = await fetch('http://127.0.0.1:8787/api/depeg-monitor', { signal: AbortSignal.timeout(8000) });
+    const j = await r.json();
+    const act = j.active || [];
+    if (act.length) {
+      lines.push(`脱锚台活跃事件：${act.map((e) => `${e.key || `${e.symbol}:${e.chain}`} ${fmtBps(e.devBps)}（${e.level}）`).join('；')}`);
+      // 点火触发只认链上脱锚腿的新鲜 severe：LST/CEX 线的存量事件（如长期挂着的
+      // LST 折价）不是点火信号，避免每次点火都被存量事件误触发。
+      const freshSevere = act.some((e) => e.level === 'severe'
+        && !String(e.key || '').includes('LST') && !String(e.key || '').includes('CEX')
+        && (!e.firstSeen || (Date.now() - new Date(e.firstSeen).getTime()) < 6 * 3600 * 1000));
+      if (freshSevere) flags.push('脱锚台已有 severe 级活跃事件（链上腿、6 小时内）');
+    } else {
+      lines.push('脱锚台当前无活跃事件');
+    }
+  } catch {
+    lines.push('脱锚台快照未取到（server.js 未响应）');
+  }
+} catch (e) {
+  lines.push(`点火比价部分失败：${e.message}`);
+}
+
+lines.push('');
+lines.push('研判要求：按统一深化规格处理本点火事件（先定性：安全事件本身属风险定性，但其引发的价差/脱锚可能是流动性脱节机会——两条线分开写）；时限目标：入队后 10 分钟内产出。');
+
+const stamp = now.toISOString().replace(/[-:]/g, '').slice(0, 12); // YYYYMMDDHHMM
+const record = { at: now.toISOString(), source, title, url, flags, noPush: NO_PUSH };
+fs.appendFileSync(path.join(STATE_DIR, 'arb_ignite_log.jsonl'), JSON.stringify(record) + '\n');
+
+if (!flags.length) {
+  console.log(`[ignite] 点火已比价，无脱节（${source}：${title}），只记日志不入队`);
+  process.exit(0);
+}
+const r = enqueueArbEvent({
+  id: `ignite:${stamp}`,
+  type: 'ignite',
+  key: stamp,
+  severity: 'severe',
+  payload: { source, title, url, flags, at: now.toISOString() },
+  factsText: lines.join('\n'),
+});
+console.log(`[ignite] 已入队研判（${flags.join('；')}）enqueued=${r.enqueued}${NO_PUSH ? '（NO_PUSH 干跑队列）' : ''}`);

@@ -1,0 +1,50 @@
+{
+ "events": {
+  "PYUSD@OKX": {
+   "key": "PYUSD@OKX",
+   "symbol": "PYUSD",
+   "venue": "OKX",
+   "pair": "PYUSD-USDT",
+   "price": 0.9996092369999999,
+   "priceUsd": 0.99959923,
+   "anchor": 1.028565,
+   "anchorDevBps": 285.6,
+   "bandMedianBps": -7.1,
+   "excessBps": -274.5,
+   "peakExcessBps": -275.07747791976783,
+   "level": "severe",
+   "sim10": {
+    "filledUsd": 10000,
+    "filledPct": 100,
+    "avgPair": 1.0014582597341135,
+    "avgUsd": 1.0003666702310032
+   },
+   "sim30": {
+    "filledUsd": 30000,
+    "filledPct": 100,
+    "avgPair": 1.001552748786904,
+    "avgUsd": 1.0004610562907263
+   },
+   "firstSeen": "2026-10-28T22:38:14.013Z",
+   "lastSeen": "2026-10-28T22:52:34.062Z",
+   "lastPushAt": "2026-10-28T22:38:44.017Z",
+   "lastPushExcessBps": -275,
+   "pendingPush": false,
+   "status": "active"
+  }
+ },
+ "history": [
+  {
+   "key": "USDS@Binance",
+   "symbol": "USDS",
+   "venue": "Binance",
+   "pair": "USDSUSDT",
+   "price": 0.9999282190000001,
+   "excessBps": -155.3,
+   "level": "severe",
+   "firstSeen": "2026-10-28T11:40:19.811Z",
+   "status": "single-source-observe",
+   "note": "单 CEX 源破线，DEX 腿未同向确认（≥$100k 腿偏离未达 −25bps），只记观察不推送（矩阵报告口径）"
+  }
+ ]
+}

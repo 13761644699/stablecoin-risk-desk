@@ -1,0 +1,340 @@
+// depeg_logic.mjs — 脱锚判定纯逻辑（无 IO），server.js 与回测脚本共用，
+// 避免两套逻辑打架。改阈值语义只改这里。
+export const DEFAULT_WARN_BPS = 50; // 预警线 ±0.5%
+export const DEFAULT_SEVERE_BPS = 150; // 严重线 ±1.5%
+export const DEFAULT_CLEAR_BPS = 30; // 回到 ±0.3% 以内解除
+
+// devBps: 以 bps 计的偏离（相对 $1 锚），正数=溢价，负数=折价
+export function classifyDepeg(devBps, warnBps = DEFAULT_WARN_BPS, severeBps = DEFAULT_SEVERE_BPS) {
+  const abs = Math.abs(devBps);
+  if (abs >= severeBps) return 'severe';
+  if (abs >= warnBps) return 'warn';
+  return null;
+}
+
+export function isCleared(devBps, clearBps = DEFAULT_CLEAR_BPS) {
+  return Math.abs(devBps) <= clearBps;
+}
+
+// 双源交叉验证：主源（最深池）检出脱锚后，用副源（同链第二池 / CEX 参考）复核。
+// secondaryDevBps: 副源同期的偏离 bps；null/NaN 表示副源无数据。
+// 返回：
+//   'confirmed'   副源同向且同样越过阈值 → 真脱锚
+//   'likely'      副源同向、幅度 ≥ 阈值一半 → 大概率真
+//   'suspicious'  副源正常或反向 → 主源疑似坏点（如 USDG 2026-04-04 式聚合坏点）
+//   'unconfirmed' 副源无数据 → 无法复核，保守放行并标注
+// 注意：链特异性脱锚（某链脱、聚合价正常）是真机会——复核必须用"同链"第二源，
+// 绝不能用聚合价/其他链价格去否决链级信号。
+export function confirmDepeg(primaryDevBps, secondaryDevBps, warnBps = DEFAULT_WARN_BPS) {
+  if (secondaryDevBps === null || secondaryDevBps === undefined || !Number.isFinite(secondaryDevBps)) {
+    return 'unconfirmed';
+  }
+  const p = Math.abs(primaryDevBps);
+  const s = Math.abs(secondaryDevBps);
+  const sameSign =
+    primaryDevBps === 0 || secondaryDevBps === 0 ||
+    Math.sign(primaryDevBps) === Math.sign(secondaryDevBps);
+  if (s >= warnBps && sameSign) return 'confirmed';
+  if (s >= warnBps * 0.5 && sameSign) return 'likely';
+  return 'suspicious';
+}
+
+export function devBpsFromPrice(price) {
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return ((price - 1) / 1) * 10_000;
+}
+
+// 池子失衡比先行指标（2026-10-03）：我方币种占池子 USD 价值的比例。
+// base 即我们的币（调用方已按地址匹配），quote 为对手方。
+// 返回 0-100 的百分比；>=65 意味着我方被持续卖入池子（折价先兆），<=35 意味着被持续买走（溢价先兆）。
+// 注意：集中流动性池（Orca Whirlpool/Uniswap V3）reserves 只反映当前 tick 区间，指标偏噪，仅作先行参考不单独报警。
+export function poolImbalance(liqBase, liqQuote, priceUsd, priceNative) {
+  if (!(liqBase > 0) || !(liqQuote > 0) || !(priceUsd > 0) || !(priceNative > 0)) return null;
+  const baseUsd = liqBase * priceUsd;
+  const quoteUsd = liqQuote * (priceUsd / priceNative);
+  if (!(quoteUsd > 0)) return null;
+  return (baseUsd / (baseUsd + quoteUsd)) * 100;
+}
+
+// 失衡信号：'sell-pressure' | 'buy-pressure' | null
+export function imbalanceSignal(imb) {
+  if (imb === null || imb === undefined) return null;
+  if (imb >= 65) return 'sell-pressure';  // 我方占比过高 → 被卖入池子
+  if (imb <= 35) return 'buy-pressure';   // 我方占比过低 → 被买走
+  return null;
+}
+
+// 事件严重程度分级 S/A/B/C（由小时线回测 v2 的 32 个"首次即严重+双源"事件沉淀而来，
+// 标准见 backtest_report.md「事件分级标准」节；回测与线上共用，保证口径一致）。
+//
+// 输入 event: {
+//   peakDevBps: number,  // 事件至今最大偏离（bps，取绝对值比较）
+//   durHours: number,     // 已持续小时数（未知传 0）
+//   verdict: 'confirmed' | 'likely' | 'unconfirmed',  // 双源交叉结论
+//   breadth: 'single' | 'multi-chain' | 'whole-coin',
+//     // single=单链；multi-chain=同币≥2链24h内严重；whole-coin=币安现货同期偏离≥50bps
+// }
+// 规则按序命中（前后一致，无双标）；
+// 另：链特异性（single + 币安现货基本不动）是"套利窗口"属性，由调用方在 cexDevBps<=30 时单独标注，
+// 不改变评级——评级只回答"有多严重"，套利属性回答"能不能做"。
+export function gradeDepegEvent(event) {
+  const p = Math.abs(Number(event?.peakDevBps) || 0);
+  const d = Number(event?.durHours) || 0;
+  const v = event?.verdict;
+  const b = event?.breadth || 'single';
+  if (b === 'whole-coin') return 'S';                    // 全币种联动：暴雷风险最高
+  if (b === 'multi-chain') return 'S';                   // 多链同币：非单点流动性问题
+  if (p >= 300 && v === 'confirmed') return 'S';         // 单链极端偏离且双源确认
+  if (p >= 250) return 'A';
+  if (p >= 200 && v === 'confirmed') return 'A';
+  if (p >= 150 && d >= 24) return 'A';
+  if (p >= 200) return 'B';
+  if (p >= 150 && d >= 4) return 'B';
+  return 'C';                                            // 150~200bps 短时 wiggle
+}
+
+export const GRADE_LABEL = {
+  S: 'S（立即人工介入）',
+  A: 'A（重点跟踪）',
+  B: 'B（观察）',
+  C: 'C（轻微 wiggle）',
+};
+
+// 监控范围：10 币种分链（合约地址 2026-10-03 经 CoinGecko + DexScreener 逐一核验）
+export const DEPEG_WATCH = [
+  { symbol: 'USDT', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0xdAC17F958D2ee523a2206206994597C13D831ec7' },
+    { chain: 'Tron', ds: 'tron', address: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+      anchor: { baseSymbol: 'WTRX', cexSymbol: 'TRXUSDT' } },
+    { chain: 'Solana', ds: 'solana', address: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB' },
+    { chain: 'BSC', ds: 'bsc', address: '0x55d398326f99059fF775485246999027B3197955' },
+    { chain: 'Arbitrum', ds: 'arbitrum', address: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9' },
+  ]},
+  { symbol: 'USDC', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48' },
+    { chain: 'Solana', ds: 'solana', address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' },
+    { chain: 'Base', ds: 'base', address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' },
+    { chain: 'Arbitrum', ds: 'arbitrum', address: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831' },
+    { chain: 'BSC', ds: 'bsc', address: '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d',
+      anchor: { baseSymbol: 'WBNB', cexSymbol: 'BNBUSDT' } },
+  ]},
+  { symbol: 'USDS', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0xdC035D45d973E3EC169d2276DDab16f1e407384F' },
+    { chain: 'Solana', ds: 'solana', address: 'USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA' },
+  ]},
+  { symbol: 'USDe', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0x4c9EDD5852cd905f086C759E8383e09bff1E68B3' },
+    { chain: 'Solana', ds: 'solana', address: 'DEkqHyPN7GMRJ5cArtQFAWefqbZb33Hyf6s5iCwjEonT' },
+  ]},
+  // 2026-10-11 摘除 USD1 Tron 腿：Tron 上唯一候选池 sunswap USD1/USDT 深度≈$1，
+  // lenient 兜底反复产出 ±9–23% 垃圾报价刷屏事件 history（双源复核已拦截、未误报），
+  // 参照 2026-10-10 Gate USDD 处置（无深度的源直接 drop）。Tron 上出现有深度池时再加回。
+  { symbol: 'USD1', legs: [
+    { chain: 'BSC', ds: 'bsc', address: '0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d' },
+    { chain: 'Ethereum', ds: 'ethereum', address: '0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d' },
+  ]},
+  { symbol: 'PYUSD', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0x6c3ea9036406852006290770BEdFcAbA0e23A0e8' },
+    { chain: 'Solana', ds: 'solana', address: '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo' },
+  ]},
+  { symbol: 'RLUSD', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0x8292Bb45bf1Ee4d140127049757C2E0fF06317eD' },
+  ]},
+  { symbol: 'USDG', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0xe343167631d89B6Ffc58B88d6b7fB0228795491D' },
+    { chain: 'Solana', ds: 'solana', address: '2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH' },
+  ]},
+  { symbol: 'USDD', legs: [
+    { chain: 'Ethereum', ds: 'ethereum', address: '0x4f8e5DE400DE08B164E7421B3EE387f461beCD1A' },
+    { chain: 'BSC', ds: 'bsc', address: '0x45E51bc23D592EB2DBA86da3985299f7895d66Ba' },
+    { chain: 'Tron', ds: 'tron', address: 'TXDk8mbtRbXeYuMNS83CfKPaYYT8XWv9Hz',
+      anchor: { baseSymbol: 'WTRX', cexSymbol: 'TRXUSDT' },
+      // 2026-10-28 池子审计：DexScreener 对该地址只采样到 USDD/BBT $709 垃圾池，
+      // 真主池 SunSwap V3 USDT/USDD（$2.15M）DS 看不见、GeckoTerminal 看得见 → GT 作主源
+      geckoPrimary: true },
+  ]},
+  { symbol: 'U', legs: [
+    { chain: 'BSC', ds: 'bsc', address: '0xce24439f2d9c6a2289f741120fe202248b666666' },
+  ]},
+];
+
+// 币安现货是否上线该币（2026-10-03 经 data-api.binance.vision /api/v3/ticker/price 实测）。
+// 无现货的币种走不了"充入币安卖出"，主路径改为链上；有现货但网络支持存疑的腿标 unverified。
+export const BINANCE_SPOT_LISTED = {
+  USDT: true, USDC: true, USDS: true, USDe: true, USD1: true,
+  PYUSD: false, RLUSD: true, USDG: false, USDD: false, U: true,
+};
+
+// 无币安现货三币的退出场所（2026-10-03 deep research：CoinGecko 实时 listing + 各所文档；
+// 手续费为聚合器约 3 个月前快照，实盘前复核）。
+// 2026-10-03 用户确认账号：Bybit ✓ / Kraken ✓ / Gate.io ✓ / HTX ✗（无账号，降级为备选）。
+export const ALT_EXIT_VENUES = {
+  PYUSD: [
+    { venue: 'Bybit（有账号）', pair: 'PYUSD/USDT', nets: 'Solana/Ethereum', cost: '约$10，~5分钟，首选' },
+    { venue: 'Kraken（有账号）', pair: 'PYUSD/USD', nets: 'Ethereum/Solana/Stellar', cost: '约$80，~5-10分钟，深度最好' },
+  ],
+  USDG: [
+    { venue: 'Gate.io（有账号）', pair: 'USDG/USDT', nets: 'Solana', cost: '约$10，~5分钟，首选' },
+    { venue: 'Kraken（有账号）', pair: 'USDG/USD 或 USDC', nets: 'Ethereum/Solana', cost: '约$80，~5-10分钟' },
+  ],
+  USDD: [
+    // 注意 USDD 无 Solana 原生发行，Solana 上的 USDD 为跨链/wrapped 版本
+    { venue: 'Gate.io（有账号）', pair: 'USDD/USDT', nets: 'TRON', cost: '约$10，首选' },
+    { venue: 'SunSwap(TRON 链上)', pair: 'USDD/USDT', nets: 'TRON', cost: '0.3% 手续费，免 KYC，单池深度 $1.7M' },
+    { venue: 'HTX（无账号）', pair: 'USDD/USDT', nets: 'BSC/TRON/Ethereum', cost: '深度最好但用户无账号，仅备选' },
+  ],
+};
+// 币安 CEX 快线：各币种充提网络与典型到账时间（分钟），用于"耗时最短"路径推荐。
+// 时间为经验值（链拥堵时顺延）；手续费与网络可用性以币安提币页实时为准。
+// unverified: true = 该网络充值支持未经核实（公开接口查不到，需用户在币安 App 充值页核对），路径中会明确标注。
+// CEX 现货价格监控（2026-10-03 用户要求）：10 个币种在主流交易所的现货价纳入脱锚监控，
+// 有价格就监控，偏离同样告警。数据源均为公开免费 API（2026-10-03 实测可用）。
+// quote 为计价货币（USDT 本位对需注意 USDT 本身偏离时的失真，推送中会标注）。
+export const CEX_SPOT_WATCH = [
+  { symbol: 'USDT',  exchange: 'Binance', pair: 'USDTUSD',   quote: 'USD' },
+  { symbol: 'USDC',  exchange: 'Binance', pair: 'USDCUSDT',  quote: 'USDT' },
+  { symbol: 'USDS',  exchange: 'Binance', pair: 'USDSUSDT',  quote: 'USDT' },
+  { symbol: 'USDe',  exchange: 'Binance', pair: 'USDEUSDT',  quote: 'USDT' },
+  { symbol: 'USD1',  exchange: 'Binance', pair: 'USD1USDT',  quote: 'USDT' },
+  { symbol: 'RLUSD', exchange: 'Binance', pair: 'RLUSDUSDT', quote: 'USDT' },
+  { symbol: 'U',     exchange: 'Binance', pair: 'UUSDT',     quote: 'USDT' },
+  { symbol: 'PYUSD', exchange: 'Gate',    pair: 'PYUSD_USDT', quote: 'USDT' },
+  { symbol: 'USDD',  exchange: 'Gate',    pair: 'USDD_USDT',  quote: 'USDT' },
+];
+
+// LST（流动性质押代币）监控（2026-10-03 用户要求）：
+// 10 个主流 LST / 质押版稳定币，跟踪 LST/native 比率（或 USD 价）相对 24h 基线的折价。
+// 双源复核：主源（最深池）+ 备源（次深池/另一DEX），分歧 >50bps 时标注。
+// 阈值沿用脱锚标准：-0.5% 预警 / -1.5% 严重，只看下跌方向（上涨为正常收益累积）。
+// 池地址 2026-10-03 经 DexScreener API 核实。
+export const LST_WATCH = [
+  { symbol: 'wstETH', native: 'ETH', kind: 'ratio',
+    token: '0x7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0',
+    primary: { type: 'dex', chain: 'ethereum', pair: '0x109830a1AAaD605BbF02a9dFA7B0B92EC2FB7dAa', label: 'Uniswap主网' },
+    secondary: { type: 'dex', chain: 'base', token: '0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452', pair: '0x861A2922bE165a5Bd41b1E482B49216b465e1B5F', label: 'Aerodrome Base' } },
+  { symbol: 'weETH', native: 'ETH', kind: 'ratio',
+    token: '0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee',
+    primary: { type: 'dex', chain: 'ethereum', pair: '0x7A415B19932c0105c82FDB6b720bb01B0CC2CAe3', label: 'Uniswap主网' },
+    secondary: { type: 'dex', chain: 'base', token: '0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A', pair: '0x91F0f34916Ca4E2cCe120116774b0e4fA0cdcaA8', label: 'Aerodrome Base' } },
+  { symbol: 'cbETH', native: 'ETH', kind: 'ratio',
+    token: '0xbe9895146f7af8a22c624c72a1f3035d97ab1406f',
+    primary: { type: 'dex', chain: 'base', pair: '0xB1383DC47D9971Fc999C3A9088F79E744b376e97', label: 'Hydrex Base' },
+    secondary: null },
+  { symbol: 'rETH', native: 'ETH', kind: 'ratio',
+    token: '0xae78736cd615f374d3085c652b38249b0d0b2d9056c',
+    primary: { type: 'dex', chain: 'ethereum', pair: '0x553e9C493678d8606d6a5ba284643dB2110Df823', label: 'Uniswap主网' },
+    secondary: null },
+  { symbol: 'JitoSOL', native: 'SOL', kind: 'ratio',
+    token: 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+    primary: { type: 'dex', chain: 'solana', pair: 'Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp', label: 'Orca' },
+    secondary: { type: 'dex', chain: 'solana', token: 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', pair: 'ERgpKaq59Nnfm9YRVAAhnq16cZhHxGcDoDWCzXbhiaNw', label: 'Meteora' } },
+  { symbol: 'mSOL', native: 'SOL', kind: 'ratio',
+    token: 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
+    primary: { type: 'dex', chain: 'solana', pair: 'HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur', label: 'Meteora' },
+    secondary: null },
+  { symbol: 'BNSOL', native: 'SOL', kind: 'ratio',
+    primary: { type: 'cex', exchange: 'Binance', pair: 'BNSOLSOL', label: 'Binance现货' },
+    secondary: null },
+  { symbol: 'wBETH', native: 'ETH', kind: 'ratio',
+    primary: { type: 'cex', exchange: 'Binance', pair: 'WBETHETH', label: 'Binance现货' },
+    secondary: null },
+  { symbol: 'sUSDe', native: 'USD', kind: 'usd',
+    token: '0x9d39a5de30e57443bff2a07b575536f56b539d',
+    primary: { type: 'dex', chain: 'ethereum', pair: '0xb20351bcf606dcc3525d2ed36760a86a5dec7423b77d41125bd4a416ba93448b', label: 'Uniswap主网sUSDe/USDT' },
+    secondary: null },
+  { symbol: 'sUSDS', native: 'USD', kind: 'usd',
+    token: '0xa3931d71877c0e7a3148cb22b658ac27d26f3527',
+    primary: { type: 'dex', chain: 'ethereum', pair: '0x81A2612F6dEA269a6Dd1F6DeAb45C5424EE2c4b7', label: 'Curve主网sUSDS/frxUSD' },
+    secondary: null },
+];
+
+export const BINANCE_FAST_LANES = {
+  USDT: [
+    { network: 'SOL', chain: 'Solana', timeMin: 1 },
+    { network: 'BEP20', chain: 'BSC', timeMin: 3 },
+    { network: 'TRC20', chain: 'Tron', timeMin: 3 },
+    { network: 'ARBITRUM', chain: 'Arbitrum', timeMin: 10 },
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15 },
+  ],
+  USDC: [
+    { network: 'SOL', chain: 'Solana', timeMin: 1 },
+    { network: 'BEP20', chain: 'BSC', timeMin: 3 },
+    { network: 'ARBITRUM', chain: 'Arbitrum', timeMin: 10 },
+    { network: 'BASE', chain: 'Base', timeMin: 10 },
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15 },
+  ],
+  USDS: [
+    { network: 'SOL', chain: 'Solana', timeMin: 1, unverified: true }, // 2026-10-03: 币安是否支持 SOL 网络 USDS 充值待核实
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15 },
+  ],
+  USDe: [
+    // 2026-10-03 用户实测：币安不接受 SOL 网络 USDe 充值，SOL 腿删除。
+    // 2026-10-03 用户确认：Solana USDe 可用桥为 LI.FI 和 Ethena 官方桥（此前误写为 LayerZero OFT，已修正）。
+    // 2026-10-03 用户实测：桥损耗约 $10 / $10k（0.1%）。
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15, bridgeFrom: 'Solana', bridgeNote: '需先经 LI.FI 或 Ethena 官方桥将 USDe 从 Solana 桥至 Ethereum（约 5-10 分钟，桥费约 $10/$10k，用户 2026-10-03 实测）' },
+  ],
+  USD1: [
+    { network: 'BEP20', chain: 'BSC', timeMin: 3, unverified: true }, // 2026-10-03: USD1 各网络充值支持待核实
+    { network: 'TRC20', chain: 'Tron', timeMin: 3, unverified: true },
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15, unverified: true },
+  ],
+  PYUSD: [
+    { network: 'SOL', chain: 'Solana', timeMin: 1 },
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15 },
+  ],
+  RLUSD: [{ network: 'ERC20', chain: 'Ethereum', timeMin: 15 }],
+  USDG: [
+    { network: 'SOL', chain: 'Solana', timeMin: 1 },
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15 },
+  ],
+  USDD: [
+    { network: 'BEP20', chain: 'BSC', timeMin: 3 },
+    { network: 'TRC20', chain: 'Tron', timeMin: 3 },
+    { network: 'ERC20', chain: 'Ethereum', timeMin: 15 },
+  ],
+  U: [{ network: 'BEP20', chain: 'BSC', timeMin: 3, unverified: true }], // 2026-10-03: U 的 BEP20 充值支持待核实
+};
+
+// 最快套利路径推荐（规则版，供慢线 enrich 流程在确认"流动性脱锚"后调用）。
+// 返回多行：主路径（币安，有现货才走）+ 备选（链上）。用户 2026-10-03 纠正：
+// 1) 有些币币安无现货（PYUSD/USDg/USDD），走不了币安退出；2) 折价不一定要在币安卖，链上等回归卖出也是路。
+export function fastestArbPath(symbol, chain, price) {
+  const lanes = (BINANCE_FAST_LANES[symbol] || []).slice().sort((a, b) => a.timeMin - b.timeMin);
+  const hasSpot = !!BINANCE_SPOT_LISTED[symbol];
+  const px = price.toFixed(4);
+  const lines = [];
+  if (price < 1) {
+    // 折价：在链上买入便宜的币
+    if (hasSpot && lanes.length) {
+      const sameChain = lanes.find((l) => l.chain === chain);
+      const lane = sameChain || lanes[0];
+      // 脱锚链与充值链不一致时（如 Solana 脱锚但只能走 ERC20 充值），必须先跨链桥
+      const bridgeLeg = lane.bridgeFrom && lane.bridgeFrom === chain && lane.bridgeNote
+        ? ` → ${lane.bridgeNote}` : '';
+      const unver = lane.unverified ? '（⚠️该网络充值支持待核实，动手前在币安充值页确认）' : '';
+      lines.push(`主路径（币安）：在 ${chain} 按 $${px} 买入 ${symbol}${bridgeLeg} → 经币安 ${lane.network}（约 ${lane.timeMin} 分钟）充入${unver} → 在币安按市价卖出`);
+    } else if (!hasSpot) {
+      const alts = (ALT_EXIT_VENUES[symbol] || [])
+        .map(v => `${v.venue} ${v.pair}（充值网络 ${v.nets}，${v.cost}）`).join('；');
+      lines.push(`主路径（其他所）：币安无 ${symbol} 现货。在 ${chain} 按 $${px} 买入 → 充到以下任一所卖出：${alts || '暂无已验证退出所，链上持有等回归'}`);
+      lines.push(`备选（链上）：在 ${chain} 按 $${px} 买入 → 不跨所，在 DEX 等回归后卖出（承担不回归风险）`);
+    } else {
+      lines.push(`主路径：在 ${chain} 按 $${px} 买入 ${symbol}（币安快线暂无配置，手动确认充值网络）`);
+      lines.push(`备选（链上）：在 ${chain} 按 $${px} 买入 ${symbol} → 不跨所，在 DEX 等回归后卖出。无跨所时间/手续费，但承担价格不回归的风险`);
+    }
+  } else {
+    // 溢价：在币安买入 → 提到脱锚链卖出
+    if (hasSpot && lanes.length) {
+      const sameChain = lanes.find((l) => l.chain === chain);
+      const lane = sameChain || lanes[0];
+      const bridgeOut = lane.chain !== chain
+        ? ` → 再经跨链桥至 ${chain}（如 LI.FI，约 5-10 分钟 + 桥费）` : '';
+      const unver = lane.unverified ? '（⚠️该网络提币支持待核实，动手前在币安提币页确认）' : '';
+      lines.push(`主路径（币安）：在币安买入 ${symbol} → 经 ${lane.network}（约 ${lane.timeMin} 分钟）提到 ${lane.chain}${bridgeOut}${unver} → 在链上按 $${px} 卖出`);
+    } else {
+      lines.push(`主路径：在有 ${symbol} 现货的交易所买入 → 提到 ${chain} → 在链上按 $${px} 卖出（币安无现货，走不了币安买入）`);
+    }
+  }
+  if (!lanes.length && hasSpot) return '暂无该币种的币安快线配置';
+  return lines.join('\n');
+}

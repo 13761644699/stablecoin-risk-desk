@@ -257,7 +257,7 @@ type NotificationPayload = {
   }
 }
 
-const routeSymbols = ['USDC', 'USDT', 'DAI', 'FRAX', 'USDE', 'sUSDe']
+const routeSymbols = ['USDC', 'USDT', 'USD1', 'FRAX', 'USDE', 'sUSDe']
 const redemptionFocusLimit = 20
 const coreRedemptionSymbols = new Set([
   'sUSDe',

@@ -2,6 +2,24 @@ import crypto from 'crypto';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import {
+  DEPEG_WATCH,
+  GRADE_LABEL,
+  classifyDepeg,
+  confirmDepeg,
+  gradeDepegEvent,
+  imbalanceSignal,
+  isCleared,
+  poolImbalance,
+} from './depeg_logic.mjs';
+import { startCexDipPoller } from './cex_dip_watch.mjs';
+import { enqueueArbEvent, removeFromQueue, krakenUsdRefs, arbDoneRecent, appendEpisodeSummary, fmtDurMin } from './arb_lib.mjs';
+
+// 2026-10-11：console 加行内时间戳（depeg_service.log 排障用；下次 server.js 重启生效）
+for (const _m of ['log', 'error', 'warn']) {
+  const _orig = console[_m].bind(console);
+  console[_m] = (..._args) => _orig(`[${new Date().toISOString()}]`, ..._args);
+}
 
 const LOCAL_ENV_FILES = [
   path.resolve('D:/desktop/币安eth/eth.env'),
@@ -39,9 +57,10 @@ const WATCH_SYMBOLS = [
   'USDT',
   'USDC',
   'USDS',
-  'DAI',
   'USDE',
   'SUSDE',
+  'USD1',
+  'U',
   'PYUSD',
   'FDUSD',
   'FRAX',
@@ -60,6 +79,7 @@ const WATCH_SYMBOLS = [
   'BOLD',
   'USDP',
 ];
+// 2026-10-03：DAI 从监控范围剔除（用户明确不要）；新增 USD1、U（United Stables）
 
 const PRIORITY_SYMBOLS = new Set(WATCH_SYMBOLS);
 const PINNED_SYMBOLS = new Map(
@@ -116,7 +136,8 @@ const CORE_REDEMPTION_SYMBOLS = new Set([
 const A0_NOTIFICATION_INTERVAL_MS = Number(process.env.A0_NOTIFICATION_INTERVAL_MS || 60_000);
 const A0_NOTIFICATION_COOLDOWN_MS = Number(process.env.A0_NOTIFICATION_COOLDOWN_MS || 30 * 60_000);
 
-const ROUTE_TOKENS = ['USDC', 'USDT', 'DAI', 'FRAX', 'USDE', 'SUSDE'];
+const ROUTE_TOKENS = ['USDC', 'USDT', 'USD1', 'FRAX', 'USDE', 'SUSDE'];
+// 2026-10-03：DAI -> USD1（用户不要 DAI）
 const EXCHANGE_STABLE_MARKETS = [
   { exchange: 'Binance', symbol: 'USDC', pair: 'USDCUSDT', quote: 'USDT', type: 'binance' },
   { exchange: 'Binance', symbol: 'FDUSD', pair: 'FDUSDUSDT', quote: 'USDT', type: 'binance' },
@@ -124,6 +145,8 @@ const EXCHANGE_STABLE_MARKETS = [
   { exchange: 'Binance', symbol: 'USDS', pair: 'USDSUSDT', quote: 'USDT', type: 'binance' },
   { exchange: 'Binance', symbol: 'TUSD', pair: 'TUSDUSDT', quote: 'USDT', type: 'binance' },
   { exchange: 'Binance', symbol: 'USDP', pair: 'USDPUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'USD1', pair: 'USD1USDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'RLUSD', pair: 'RLUSDUSDT', quote: 'USDT', type: 'binance' },
   { exchange: 'OKX', symbol: 'USDC', pair: 'USDC-USDT', quote: 'USDT', type: 'okx' },
   { exchange: 'OKX', symbol: 'PYUSD', pair: 'PYUSD-USDT', quote: 'USDT', type: 'okx' },
   { exchange: 'OKX', symbol: 'USDS', pair: 'USDS-USDT', quote: 'USDT', type: 'okx' },
@@ -145,7 +168,8 @@ const EXCHANGE_REDEMPTION_MARKETS = [
 const CHAIN_SPREAD_SYMBOLS = [
   'USDC',
   'USDT',
-  'DAI',
+  'USD1',
+  'U',
   'USDS',
   'FDUSD',
   'USDE',
@@ -156,6 +180,7 @@ const CHAIN_SPREAD_SYMBOLS = [
   'crvUSD',
   'AUSD',
 ];
+// 2026-10-03：剔除 DAI，新增 USD1、U
 const CHAIN_SPREAD_ALERT_BPS = 10;
 const CHAIN_SPREAD_PRICE_BAND = [0.985, 1.015];
 const CANONICAL_TOKEN_ADDRESSES = new Map([
@@ -2826,7 +2851,7 @@ async function getRoutes(query) {
   const toToken = chooseToken(tokens, toChain, symbol);
 
   if (!fromToken || !toToken) {
-    throw new Error(`当前链对暂时没有找到可用的 ${symbol} 跨链路径，可能需要选择 USDC、DAI，或确认该链上是否为 USDT0/桥接版本`);
+    throw new Error(`当前链对暂时没有找到可用的 ${symbol} 跨链路径，可能需要选择 USDC、USD1，或确认该链上是否为 USDT0/桥接版本`);
   }
 
   const amountRaw = parseAmount(amount, fromToken.decimals);
@@ -3483,6 +3508,921 @@ async function getRedemptionSpreads() {
   };
 }
 
+// ============================================================================
+// 脱锚套利监控（2026-10-03 新增）：10 币种分链盯 DexScreener 价格，
+// 偏离 ±0.5% 预警 / ±1.5% 严重，经 PushPlus 推送；事件落盘 state/depeg_events.json
+// 供后续"新闻定性 + 套利路径"富化流程消费（enriched=false）。
+// 开关：DEPEG_MONITOR_ENABLED=1 才启动轮询（默认关闭，用户本地跑不受影响）。
+// 注意：Tron 等链上稳定币恒为 quote 端，用锚定法（TRX/BNB 的币安现货价 ÷ 链上锚定对 priceNative）反推。
+// ============================================================================
+const DEPEG_MONITOR_ENABLED = process.env.DEPEG_MONITOR_ENABLED === '1';
+const DEPEG_SCAN_INTERVAL_MS = Number(process.env.DEPEG_SCAN_INTERVAL_MS || 300_000);
+const DEPEG_WARN_BPS = Number(process.env.DEPEG_WARN_BPS || 50);
+const DEPEG_SEVERE_BPS = Number(process.env.DEPEG_SEVERE_BPS || 150);
+const DEPEG_CLEAR_BPS = Number(process.env.DEPEG_CLEAR_BPS || 30);
+const DEPEG_MIN_LIQ_USD = Number(process.env.DEPEG_MIN_LIQ_USD || 20_000);
+const DEPEG_PRICE_BAND = [0.5, 1.5]; //  sanity 带：过滤错报价；真崩盘（>50%）不在套利范围
+// 2026-10-25 用户拍板：metric 剔出触发源、只留观察。metric 已三度坏点假脱锚
+// （2026-10-23 ETH USDT -21.4% 假严重；2026-10-25 22:30 metric 两池同源自证放行 -810bps 假严重），
+// 且 DexScreener 对 ETH USDT 的 base 向采样常被 metric 占满。规则：
+// ①metric 池不得作同链复核副源；②metric 作主力时该腿标记 observeOnly，
+// 须非 metric 独立源（同链第二池 / GeckoTerminal 备用源）确认同向脱锚才建事件，
+// 否则只记 history 观察、不推送。metric 价格本身仍采集、仍上看板（观察）。
+const DEPEG_OBSERVE_ONLY_DEX = new Set(['metric']);
+const isObserveOnlyDex = (dex) => DEPEG_OBSERVE_ONLY_DEX.has(String(dex || '').toLowerCase());
+// 2026-10-28 用户立规：流动性不佳的池子不报。DEX 腿主池流动性 < $100,000 → 只观察：
+// 价格照常采集上看板，但不建事件、不重报、复核副源也必须 ≥ 此门槛（薄池不当法官、
+// 也不当证人）。真脱锚由该币的深池腿 / 交易所价格触发，不靠薄池。
+// 起因：USDD@Ethereum 的 Uniswap 池仅约 $49.5k，被砸到 −169bps 后趴着不恢复，
+// 12:03/12:33/13:03 连推三次，而 Tron 主池与 HTX/KuCoin/聚合价全部正常。
+const DEPEG_TRIGGER_MIN_LIQ_USD = Number(process.env.DEPEG_TRIGGER_MIN_LIQ_USD || 100_000);
+const DEPEG_STATE_FILE =
+  process.env.DEPEG_STATE_FILE || path.join(process.cwd(), 'state', 'depeg_events.json');
+const DEPEG_WARN_REPUSH_MS = Number(process.env.DEPEG_WARN_REPUSH_MS || 30 * 60_000);
+const DEPEG_SEVERE_REPUSH_MS = Number(process.env.DEPEG_SEVERE_REPUSH_MS || 15 * 60_000);
+const PUSHPLUS_TOKEN_FILE =
+  process.env.PUSHPLUS_TOKEN_FILE ||
+  path.join(process.env.HOME || '/home/hatch', 'workspace', 'dividend-detector', '.pushplus_token');
+
+// DEPEG_WATCH / BINANCE_FAST_LANES 见 depeg_logic.mjs（server.js 与回测脚本共用）
+
+
+
+const depegMonitorState = {
+  enabled: DEPEG_MONITOR_ENABLED,
+  checkedAt: null,
+  lastScanAt: null,
+  lastError: null,
+  activeCount: 0,
+};
+
+let pushplusTokenCache = null;
+function getPushplusToken() {
+  if (pushplusTokenCache !== null) return pushplusTokenCache;
+  const fromEnv = String(process.env.PUSHPLUS_TOKEN || '').trim();
+  if (fromEnv) {
+    pushplusTokenCache = fromEnv;
+    return pushplusTokenCache;
+  }
+  try {
+    pushplusTokenCache = fs.readFileSync(PUSHPLUS_TOKEN_FILE, 'utf8').trim() || null;
+  } catch {
+    pushplusTokenCache = null;
+  }
+  return pushplusTokenCache;
+}
+
+// PushPlus：JSON 不转义中文（JSON.stringify 默认输出 UTF-8），Content-Type 带 charset
+async function sendPushplus(title, content) {
+  const token = getPushplusToken();
+  if (!token) {
+    console.log('[depeg] pushplus token 缺失，跳过推送');
+    return { ok: false, reason: 'no-token' };
+  }
+  const response = await fetch('https://www.pushplus.plus/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ token, title, content, template: 'markdown' }),
+  });
+  const data = await response.json().catch(() => ({}));
+  console.log(`[depeg] pushplus -> code=${data.code} title=${title}`);
+  return { ok: data.code === 200, code: data.code };
+}
+
+// Bark（iPhone critical 穿透勿扰）：key 文件 ~/.bark_key，内容为 https://api.day.app/xxxx。
+// 未配置时直接返回 false，主流程不受影响。S/A 级事件调用。
+const BARK_KEY_FILE = path.join(process.env.HOME || '/home/hatch', '.bark_key');
+let barkKeyCache = null;
+function getBarkKey() {
+  if (barkKeyCache !== null) return barkKeyCache;
+  try {
+    const v = fs.readFileSync(BARK_KEY_FILE, 'utf8').trim().replace(/\/+$/, '');
+    barkKeyCache = v.startsWith('http') ? v : null;
+  } catch { barkKeyCache = null; }
+  return barkKeyCache;
+}
+async function sendBark(title, content) {
+  const base = getBarkKey();
+  if (!base) return { ok: false, reason: 'no-key' };
+  try {
+    const url = `${base}/push?title=${encodeURIComponent(title)}&body=${encodeURIComponent(String(content).slice(0, 800))}&level=critical&volume=10&sound=horn&badge=1`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'stablecoin-risk-desk/1.0' } });
+    console.log(`[depeg] bark -> status=${res.status} title=${title}`);
+    return { ok: res.status === 200, status: res.status };
+  } catch (e) {
+    console.log(`[depeg] bark 异常：${e.message}`);
+    return { ok: false, reason: e.message };
+  }
+}
+
+function loadDepegEvents() {
+  try {
+    const raw = fs.readFileSync(DEPEG_STATE_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.events) return parsed;
+  } catch {
+    // 文件不存在或损坏：从空开始
+  }
+  return { events: {}, history: [] };
+}
+
+function saveDepegEvents(state) {
+  fs.mkdirSync(path.dirname(DEPEG_STATE_FILE), { recursive: true });
+  fs.writeFileSync(DEPEG_STATE_FILE, JSON.stringify(state, null, 1));
+}
+
+async function depegDexPairs(dsChain, address) {
+  // 合并 tokens/v1（精确但只采样 1 个 pair）+ search（最多 30 个）再挑最深的；
+  // search 对个别地址会返回错链结果（如 USDT-eth 曾返回 30 个 pulsechain pair），按链过滤。
+  const seen = new Map();
+  const add = (pairs) => {
+    for (const p of pairs || []) {
+      if (p?.chainId !== dsChain) continue;
+      const key =
+        String(p.pairAddress || '').toLowerCase() ||
+        `${p.dexId}-${p?.baseToken?.address}-${p?.quoteToken?.address}`.toLowerCase();
+      if (!seen.has(key)) seen.set(key, p);
+    }
+  };
+  try {
+    const data = await fetchJson(
+      `https://api.dexscreener.com/tokens/v1/${dsChain}/${address}`,
+    );
+    add(Array.isArray(data) ? data : []);
+  } catch {
+    // 掉到 search
+  }
+  try {
+    const data = await fetchJson(
+      `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(address)}`,
+    );
+    add(Array.isArray(data?.pairs) ? data.pairs : []);
+  } catch {
+    // 两个源都失败就返回已拿到的
+  }
+  return [...seen.values()];
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function binanceSpotPrice(symbol) {
+  // data-api.binance.vision 为免墙的市场数据域名（fapi/api 主站 451）
+  const data = await fetchJson(
+    `https://data-api.binance.vision/api/v3/ticker/price?symbol=${symbol}`,
+  );
+  return numberFromPath(data.price);
+}
+
+function pickDirectPair(pairs, address, minLiq = DEPEG_MIN_LIQ_USD) {
+  const want = address.toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  const matched = pairs
+    .filter((p) => String(p?.baseToken?.address || '').toLowerCase() === want);
+  const inBand = matched
+    .map((p) => ({
+      price: numberFromPath(p.priceUsd),
+      liq: numberFromPath(p?.liquidity?.usd),
+      // 2026-10-03 池子失衡比先行指标：base 即我们的币（已按地址匹配），用 reserves 算我方占比
+      liqBase: numberFromPath(p?.liquidity?.base),
+      liqQuote: numberFromPath(p?.liquidity?.quote),
+      priceNative: numberFromPath(p.priceNative),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.price >= lo && p.price <= hi);
+  const ok = inBand
+    .filter((p) => p.liq >= minLiq)
+    .sort((a, b) => b.liq - a.liq)[0] || null;
+  if (ok && isObserveOnlyDex(ok.dex)) ok.observeOnly = true; // metric 只观察（见 DEPEG_OBSERVE_ONLY_DEX）
+  if (process.env.DEPEG_DEBUG === '1' && !ok) {
+    const best = inBand.sort((a, b) => b.liq - a.liq)[0];
+    console.log(`[depeg-debug] direct 无可用：addr=${address.slice(0, 10)} pairs=${pairs.length} base匹配=${matched.length} 带内=${inBand.length} 最佳=${best ? `${best.label} liq=${Math.round(best.liq)} px=${best.price}` : '无'}`);
+  }
+  return ok;
+}
+
+// 主力池不够深时退而求其次：用带内最深的池（标记 lowConfidence，不做降级报警的唯一依据）
+// 2026-10-28 池子审计追加：lenient 只接受 quote 为主流计价资产的池——
+// USDD/BBT（$709）这类奇异 quote 池的 USD 价由 quote 币自身价格折算，是双重垃圾报价，
+// 曾让 USDD@Tron 长期输出 -612bps 假偏差刷屏 history。
+const LENIENT_QUOTE_ALLOW = new Set([
+  'USDT', 'USDC', 'USD', 'TUSD', 'USDS', 'USDE', 'USD1', 'PYUSD', 'RLUSD', 'USDG',
+  'USDD', 'FDUSD', 'DAI', 'BUSD', 'WTRX', 'TRX', 'WBNB', 'BNB', 'WETH', 'ETH',
+  'WSOL', 'SOL',
+]);
+function pickDirectPairLenient(pairs, address) {
+  const sane = (pairs || []).filter((p) =>
+    LENIENT_QUOTE_ALLOW.has(String(p?.quoteToken?.symbol || '').toUpperCase()));
+  const best = pickDirectPair(sane, address, 0);
+  return best ? { ...best, lowConfidence: true } : null;
+}
+
+// 双源交叉验证：同链第二好的池（与主力池不同的 pairAddress，带内）。
+// 复核源门槛与触发门槛一致（≥ DEPEG_TRIGGER_MIN_LIQ_USD，2026-10-28 立规：薄池不当复核源，
+// 防 USDD@Ethereum 式"薄主池被另一个薄池报价确认"的同薄互证）。
+// 复核用，不额外调接口——pairs 已在 depegDexPairs 里一次拉回，快线零延迟。
+function pickSecondDirectPair(pairs, address, excludePairAddress, minLiq = DEPEG_TRIGGER_MIN_LIQ_USD) {
+  const want = address.toLowerCase();
+  const excl = String(excludePairAddress || '').toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  const cands = pairs
+    .filter((p) => String(p?.baseToken?.address || '').toLowerCase() === want)
+    .map((p) => ({
+      price: numberFromPath(p.priceUsd),
+      liq: numberFromPath(p?.liquidity?.usd),
+      liqBase: numberFromPath(p?.liquidity?.base),
+      liqQuote: numberFromPath(p?.liquidity?.quote),
+      priceNative: numberFromPath(p.priceNative),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.price >= lo && p.price <= hi && p.liq >= minLiq
+      && String(p.pairAddress || '').toLowerCase() !== excl
+      && !isObserveOnlyDex(p.dex)) // metric 不得作复核副源（防同源自证，2026-10-25）
+    .sort((a, b) => b.liq - a.liq);
+  return cands[0] || null;
+}
+
+// 2026-10-04 用户要求：副源（同链第二池）缺失时，用备用源复核。
+// 备用源 = GeckoTerminal 同链 top_pools（独立聚合器，仍是同链口径，
+// 不违反"链级信号必须同链复核、不能拿聚合价否决"的原则）。
+// 免费 30次/分钟；只在副源缺失时触发；失败/超时静默返回 null，不影响主流程。
+const GECKO_NET = { ethereum: 'eth', tron: 'tron', solana: 'solana', bsc: 'bsc', arbitrum: 'arbitrum', base: 'base' };
+async function geckoBackupSecond(dsChain, address, minLiq = DEPEG_TRIGGER_MIN_LIQ_USD) {
+  const net = GECKO_NET[dsChain];
+  if (!net) return null;
+  const want = String(address || '').toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  try {
+    const d = await fetchJson(
+      `https://api.geckoterminal.com/api/v2/networks/${net}/tokens/${address}?include=top_pools`,
+      { signal: AbortSignal.timeout(10000) });
+    for (const p of d?.included || []) {
+      const a = p?.attributes || {};
+      const rel = p?.relationships || {};
+      const baseAddr = String(rel?.base_token?.data?.id || '').split('_').pop().toLowerCase();
+      const quoteAddr = String(rel?.quote_token?.data?.id || '').split('_').pop().toLowerCase();
+      let price = null;
+      if (baseAddr === want) price = numberFromPath(a.base_token_price_usd);
+      else if (quoteAddr === want) price = numberFromPath(a.quote_token_price_usd);
+      if (!(price > 0)) continue;
+      const liq = numberFromPath(a.reserve_in_usd);
+      if (!(liq >= minLiq)) continue;
+      if (price < lo || price > hi) continue;
+      return { price, liq, dex: 'geckoterminal', label: `${a.name || 'pool'}(backup)`, backup: true };
+    }
+  } catch (error) {
+    console.log(`[depeg] 备用源复核失败 ${dsChain}：${error.message}`);
+  }
+  return null;
+}
+
+// 2026-10-28 池子审计新增：个别腿 DexScreener 采样不到真主池（如 USDD@Tron 只采样到
+// USDD/BBT $709 垃圾池，真主池 SunSwap V3 USDT/USDD $2.15M 只有 GeckoTerminal 可见）。
+// 这类腿在 DEPEG_WATCH 标 geckoPrimary: true，DS direct/anchor 都无果时用 GT top_pools
+// 中流动性 ≥ DEPEG_MIN_LIQ_USD 的最深池作主源（价格取该池 base/quote 侧 USD 价）。
+// 注意：GT 同时是备用复核源，故此腿 confirm 保持 null（不许同源自证，防 metric 式假确认）。
+async function geckoPrimaryPrice(dsChain, address) {
+  const net = GECKO_NET[dsChain];
+  if (!net) return null;
+  const want = String(address || '').toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  try {
+    const d = await fetchJson(
+      `https://api.geckoterminal.com/api/v2/networks/${net}/tokens/${address}?include=top_pools`,
+      { signal: AbortSignal.timeout(10000) });
+    let best = null;
+    for (const p of d?.included || []) {
+      const a = p?.attributes || {};
+      const rel = p?.relationships || {};
+      const baseAddr = String(rel?.base_token?.data?.id || '').split('_').pop().toLowerCase();
+      const quoteAddr = String(rel?.quote_token?.data?.id || '').split('_').pop().toLowerCase();
+      let price = null;
+      if (baseAddr === want) price = numberFromPath(a.base_token_price_usd);
+      else if (quoteAddr === want) price = numberFromPath(a.quote_token_price_usd);
+      if (!(price > 0)) continue;
+      const liq = numberFromPath(a.reserve_in_usd);
+      if (!(liq >= DEPEG_MIN_LIQ_USD)) continue;
+      if (price < lo || price > hi) continue;
+      if (!best || liq > best.liq) {
+        best = { price, liq, dex: 'geckoterminal', label: `${a.name || 'pool'}(gt-primary)` };
+      }
+    }
+    return best;
+  } catch (error) {
+    console.log(`[depeg] GT 主源拉取失败 ${dsChain}：${error.message}`);
+    return null;
+  }
+}
+
+function pickSecondAnchorPair(pairs, address, baseSymbol, excludePairAddress, minLiq = DEPEG_TRIGGER_MIN_LIQ_USD) {
+  const want = address.toLowerCase();
+  const wantBase = String(baseSymbol).toUpperCase();
+  const excl = String(excludePairAddress || '').toLowerCase();
+  const cands = pairs
+    .filter((p) => String(p?.quoteToken?.address || '').toLowerCase() === want)
+    .filter((p) => String(p?.baseToken?.symbol || '').toUpperCase() === wantBase)
+    .map((p) => ({
+      priceNative: numberFromPath(p.priceNative),
+      liq: numberFromPath(p?.liquidity?.usd),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.priceNative > 0 && p.liq >= minLiq
+      && String(p.pairAddress || '').toLowerCase() !== excl
+      && !isObserveOnlyDex(p.dex)) // metric 不得作复核副源（2026-10-25）
+    .sort((a, b) => b.liq - a.liq);
+  return cands[0] || null;
+}
+
+function pickAnchorPair(pairs, address, baseSymbol) {
+  const want = address.toLowerCase();
+  const wantBase = String(baseSymbol).toUpperCase();
+  return pairs
+    .filter((p) => String(p?.quoteToken?.address || '').toLowerCase() === want)
+    .filter((p) => String(p?.baseToken?.symbol || '').toUpperCase() === wantBase)
+    .map((p) => ({
+      priceNative: numberFromPath(p.priceNative),
+      liq: numberFromPath(p?.liquidity?.usd),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.priceNative > 0 && p.liq >= DEPEG_MIN_LIQ_USD)
+    .sort((a, b) => b.liq - a.liq)[0] || null;
+}
+
+async function getDepegLegPrices() {
+  // 逐地址走 DexScreener search（最多 30 个 pair/地址），一轮约 26 个请求
+  const byChain = new Map();
+  for (const coin of DEPEG_WATCH) {
+    for (const leg of coin.legs) {
+      const list = byChain.get(leg.ds) || [];
+      list.push({ coin: coin.symbol, leg });
+      byChain.set(leg.ds, list);
+    }
+  }
+  const anchorPrices = new Map(); // cexSymbol -> price
+  const out = [];
+  for (const [dsChain, items] of byChain) {
+    for (const { coin, leg } of items) {
+      let pairs = [];
+      try {
+        pairs = await depegDexPairs(dsChain, leg.address);
+      } catch (error) {
+        console.log(`[depeg] 拉取 ${coin}@${leg.chain} 失败：${error.message}`);
+      }
+      await sleep(250); // 给免费接口留气口，避免被限流返回残缺数据
+      const direct = pickDirectPair(pairs, leg.address);
+      if (direct) {
+        // 双源交叉：同链第二池（已拉回的数据，零额外延迟）；
+        // 缺失时用 GeckoTerminal 同链 top_pools 做备用复核（2026-10-04 用户要求）
+        let second = pickSecondDirectPair(pairs, leg.address, direct.pairAddress);
+        // 2026-10-04：备用源只在"主源真有脱锚信号"时才查（GeckoTerminal 免费 30次/分钟，
+        // 全量查会 429；无脱锚时复核结论用不上，省掉调用）
+        if (!second && Math.abs((direct.price - 1) * 10_000) >= DEPEG_WARN_BPS) {
+          second = await geckoBackupSecond(leg.ds, leg.address);
+        }
+        // 池子失衡比先行指标（2026-10-03）：用主力池 reserves 算，不新增请求
+        const imb = poolImbalance(direct.liqBase, direct.liqQuote, direct.price, direct.priceNative);
+        out.push({ symbol: coin, chain: leg.chain, price: direct.price,
+          priceNative: direct.priceNative, // 交叉对源头换算用（原始对价，2026-10-30）
+          liq: direct.liq, dex: direct.dex, pair: direct.label, method: 'direct',
+          observeOnly: Boolean(direct.observeOnly),
+          poolImbalance: imb === null ? null : Math.round(imb * 10) / 10,
+          imbalanceSig: imbalanceSignal(imb),
+          confirmPrice: second ? second.price : null,
+          confirmDevBps: second ? (second.price - 1) * 10_000 : null,
+          confirmSrc: second ? `${second.dex} ${second.label}` : null });
+        continue;
+      }
+      // 2026-10-28 池子审计：标 geckoPrimary 的腿（DexScreener 采样不到真主池，
+      // 如 USDD@Tron）先用 GeckoTerminal 主源；confirm 留空，不许同源自证。
+      if (leg.geckoPrimary) {
+        const gp = await geckoPrimaryPrice(leg.ds, leg.address);
+        if (gp) {
+          out.push({ symbol: coin, chain: leg.chain, price: gp.price,
+            liq: gp.liq, dex: gp.dex, pair: gp.label, method: 'gecko-primary',
+            confirmPrice: null, confirmDevBps: null, confirmSrc: null });
+          continue;
+        }
+      }
+      if (leg.anchor) {
+        const ap = pickAnchorPair(pairs, leg.address, leg.anchor.baseSymbol);
+        if (ap) {
+          if (!anchorPrices.has(leg.anchor.cexSymbol)) {
+            try {
+              anchorPrices.set(leg.anchor.cexSymbol, await binanceSpotPrice(leg.anchor.cexSymbol));
+            } catch (error) {
+              console.log(`[depeg] 锚定价 ${leg.anchor.cexSymbol} 拉取失败：${error.message}`);
+              anchorPrices.set(leg.anchor.cexSymbol, 0);
+            }
+          }
+          const anchorPx = anchorPrices.get(leg.anchor.cexSymbol);
+          if (anchorPx > 0) {
+            let ap2 = pickSecondAnchorPair(pairs, leg.address, leg.anchor.baseSymbol, ap.pairAddress);
+            // 副源缺失时用备用源：GeckoTerminal 同链池的直接 USD 价（2026-10-04 用户要求）；
+            // 只在主源真有脱锚信号时查（省免费额度，防 429）
+            let backupPx = null;
+            if (!ap2 && Math.abs((anchorPx / ap.priceNative - 1) * 10_000) >= DEPEG_WARN_BPS) {
+              const bk = await geckoBackupSecond(leg.ds, leg.address);
+              if (bk) { backupPx = bk.price; ap2 = bk; }
+            }
+            const cPrice = ap2 ? (backupPx !== null ? backupPx : anchorPx / ap2.priceNative) : null;
+            out.push({ symbol: coin, chain: leg.chain, price: anchorPx / ap.priceNative,
+              liq: ap.liq, dex: ap.dex, pair: ap.label, method: `anchor(${leg.anchor.baseSymbol})`,
+              confirmPrice: cPrice,
+              confirmDevBps: cPrice !== null ? (cPrice - 1) * 10_000 : null,
+              confirmSrc: ap2 ? (backupPx !== null
+                ? `${ap2.dex} ${ap2.label}`
+                : `${ap2.dex} ${ap2.label}(anchor)`) : null });
+            continue;
+          }
+        }
+      }
+      // 主力池不够深时退而求其次：带内最深池（低置信度，仅作参考）。
+      // 2026-10-28 顺序调整：lenient 排在 geckoPrimary 与 anchor 之后——
+      // 此前 lenient 抢在 anchor 前面，让 USDD@Tron 的 $709 垃圾池永远截胡锚定法。
+      const lenient = pickDirectPairLenient(pairs, leg.address);
+      if (lenient) {
+        let second = pickSecondDirectPair(pairs, leg.address, lenient.pairAddress);
+        // 2026-10-04：同上，备用源只在主源真有脱锚信号时查
+        if (!second && Math.abs((lenient.price - 1) * 10_000) >= DEPEG_WARN_BPS) {
+          second = await geckoBackupSecond(leg.ds, leg.address);
+        }
+        out.push({ symbol: coin, chain: leg.chain, price: lenient.price,
+          liq: lenient.liq, dex: lenient.dex, pair: lenient.label,
+          method: 'direct(low-liq)', lowConfidence: true, observeOnly: Boolean(lenient.observeOnly),
+          confirmPrice: second ? second.price : null,
+          confirmDevBps: second ? (second.price - 1) * 10_000 : null,
+          confirmSrc: second ? `${second.dex} ${second.label}` : null });
+        continue;
+      }
+      out.push({ symbol: coin, chain: leg.chain, price: 0, liq: 0, dex: null, pair: null,
+        method: 'no-data', error: '无可用报价' });
+    }
+  }
+  return out;
+}
+
+function depegLevel(devBps) {
+  return classifyDepeg(devBps, DEPEG_WARN_BPS, DEPEG_SEVERE_BPS);
+}
+
+// 初版最快路径推荐见 depeg_logic.mjs fastestArbPath（供慢线 enrich 流程调用）
+
+// 快线推送：raw 报警（币种/链/偏离/级别），不等待新闻核实；
+// 慢线（新闻定性+套利路径）由 enrich 流程消费 depeg_events.json 后补发。
+// 事件评级 S/A/B/C：峰值/持续/双源/广度 → gradeDepegEvent（规则见 depeg_logic.mjs）。
+// breadth live 口径：store.events 里同币≥2 条活跃链 → multi-chain，否则 single；
+// live 无币安现货参考价，whole-coin 不在快线使用（由慢线/回测判定）。
+function gradeLiveEvent(event, store) {
+  const chains = new Set();
+  for (const k of Object.keys((store && store.events) || {})) {
+    const e = store.events[k];
+    if (e && e.status === 'active' && e.symbol === event.symbol) chains.add(e.chain);
+  }
+  chains.add(event.chain);
+  const breadth = chains.size >= 2 ? 'multi-chain' : 'single';
+  const durHours = event.firstSeen ? (Date.now() - new Date(event.firstSeen).getTime()) / 3600 : 0;
+  const grade = gradeDepegEvent({
+    peakDevBps: Math.abs(event.peakDevBps ?? event.devBps ?? 0),
+    durHours,
+    // 白名单制（2026-10-30）：白名单腿触发的事件在定级时视作已确认——
+    // 触发源本身已过深度准入，不再要求第二源同向（双源复核已拆）。
+    verdict: event.whitelisted === true ? 'confirmed' : (event.confirm || 'unconfirmed'),
+    breadth,
+  });
+  // 2026-10-03 用户要求：S 级多链联动可能是暴雷（基本面），推送必须明确是风险警告而非机会
+  event.breadth = breadth;
+  return grade;
+}
+
+// 带评级的推送（2026-10-30 起仅 resolved 解除直发使用；新建/升级/重报改走
+// enqueueDepegArb 入队深化研判）：标题前缀 [S]/[A]/[B]/[C]；S/A 级额外走 Bark critical
+// （~/.bark_key 未配置则静默跳过，不影响 PushPlus 主流程）。
+// 2026-10-03 用户要求：半夜（00:00–08:00 北京时间）Bark 只在偏离 ≥5% 时触发，
+// 微信（PushPlus）全天按正常阈值推送。事件照常跟踪。
+// 2026-10-20 用户要求：半夜脱锚一律不走 Bark（之前是偏离 ≥5% 才响，现已停用）
+const NIGHT_BARK_MIN_BPS = 500; // 已停用，保留作记录
+function isNightQuietHours() {
+  const h = Number(new Date().toLocaleString('en-US',
+    { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }));
+  return h >= 0 && h < 8;
+}
+// 2026-10-04 用户要求：08:00–10:00 早上完全静默，任何推送都不发
+function isMorningQuietHours() {
+  const h = Number(new Date().toLocaleString('en-US',
+    { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }));
+  return h >= 8 && h < 10;
+}
+async function pushDepegWithGrade(store, event, kind, titleCore) {
+  // 2026-10-04 用户澄清：08:00–10:00 严重脱锚照常推送（白天规则），只有预警级压到 10 点
+  const isSeverePush = kind === 'severe' || event.level === 'severe';
+  if (isMorningQuietHours() && !isSeverePush) {
+    console.log(`[depeg] 早上静默（08:00–10:00）预警级不推：${event.symbol}@${event.chain} ${event.devBps}bps`);
+    return { ok: false, quiet: true };
+  }
+  const grade = gradeLiveEvent(event, store);
+  event.grade = grade;
+  event.gradedAt = new Date().toISOString();
+  // 2026-10-04 用户要求（23:20 明确范围：仅 USDe@Solana）：单池 warn 级小折价不推送——
+  // $10k 在 PumpSwap constant-product 池滑点约 80bps，59bps 级折价扣掉双边滑点后无利可图；
+  // 只跟踪不推送，升级到 severe 才推。其他币种/链不受影响。
+  const isUsdeSolSmallDisc = event.symbol === 'USDe' && event.chain === 'Solana'
+    && event.breadth === 'single' && !isSeverePush && kind !== 'resolved';
+  if (isUsdeSolSmallDisc) {
+    console.log(`[depeg] USDe@Solana 单池 warn 级小折价不推送（用户要求）：${event.devBps}bps，只跟踪`);
+    return { ok: false, quiet: true };
+  }
+  // S 级多链联动：标题明确标风险，避免误读为大机会
+  const tag = (grade === 'S' && event.breadth === 'multi-chain') ? 'S-风险' : grade;
+  const title = `[${tag}] ${titleCore}`;
+  const body = formatDepegPush({ ...event, grade }, kind);
+  const r = await sendPushplus(title, body);
+  // Bark：白天 S/A 级照常；半夜（00:00–08:00）2026-10-20 用户要求：脱锚一律不走 Bark，只微信
+  // 2026-10-28 补豁免：USDD 报警只走微信、绝不 Bark（用户两次确认，HTX 风险顾虑下 USDD
+  // 单所脱锚也不例外）。此前逻辑无此豁免，2026-10-28 13:03 USDD@Ethereum 升级为严重时
+  // 仍推了 Bark，系缺口，本次补上。
+  const barkExempt = event.symbol === 'USDD';
+  const nightOk = !isNightQuietHours();
+  if ((grade === 'S' || grade === 'A') && kind !== 'resolved' && nightOk && !barkExempt) {
+    await sendBark(title, body);
+  } else if ((grade === 'S' || grade === 'A') && kind !== 'resolved' && barkExempt) {
+    console.log(`[depeg] USDD 不走 Bark（用户要求，只微信）：${event.symbol}@${event.chain} ${event.devBps}bps`);
+  } else if ((grade === 'S' || grade === 'A') && kind !== 'resolved') {
+    console.log(`[depeg] 半夜 Bark 不响（用户要求）：${event.symbol}@${event.chain} ${event.devBps}bps`);
+  }
+  return r;
+}
+function formatDepegPush(event, kind) {
+  const dir = event.devBps < 0 ? '折价' : '溢价';
+  const head = kind === 'resolved' ? '✅ 脱锚解除'
+    : kind === 'severe' ? '🚨 稳定币严重脱锚'
+    : '⚠️ 稳定币脱锚预警';
+  const lines = [
+    `${head}：${event.symbol} @ ${event.chain}`,
+    ``,
+    `- 链上价：$${event.price.toFixed(4)}（${dir} ${Math.abs(event.devBps).toFixed(1)} bps）`,
+    `- 报价源：${event.method}，${event.dex || '-'} ${event.pair || ''}，池流动性 $${Math.round(event.liq).toLocaleString()}`,
+    `- 级别：${event.level === 'severe' ? '严重（≥1.5%）' : '预警（≥0.5%）'}；首次发现 ${event.firstSeen}`,
+  ];
+  // 触发源口径（2026-10-30 白名单制）：触发腿本身即白名单深池，单源成立；
+  // 副源偏离只作记录行，不再决定建事件与否（双源复核已拆，理由见 depeg_logic.mjs 注释）。
+  if (kind !== 'resolved') {
+    lines.push(`- 触发源：白名单 ${event.method}（${event.dex || '-'} ${event.pair || ''}），单源成立`);
+    if (event.confirmSrc) {
+      lines.push(`- 副源记录：${event.confirmSrc}${event.confirmDevBps != null ? ` 偏离 ${Number(event.confirmDevBps).toFixed(1)} bps` : ''}（仅记录，不作触发条件）`);
+    }
+  }
+  if (event.lowConfidence) {
+    lines.push(`- ⚠️ 报价池较浅（$${Math.round(event.liq).toLocaleString()}），价格仅供参考，动手前请自行复核`);
+  }
+  // 池子失衡比先行指标（2026-10-03）：极端失衡可能是价格脱锚的先行信号，仅标注不单独报警
+  if (event.imbalanceSig === 'sell-pressure') {
+    lines.push(`- 📊 池子失衡：${event.symbol} 占池内价值 ${event.poolImbalance}%（≥65%），被持续卖入池子，警惕进一步折价`);
+  } else if (event.imbalanceSig === 'buy-pressure') {
+    lines.push(`- 📊 池子失衡：${event.symbol} 占池内价值 ${event.poolImbalance}%（≤35%），被持续买走，警惕溢价`);
+  }
+  if (event.grade) {
+    lines.push(`- 严重程度评级：[${event.grade}] ${GRADE_LABEL[event.grade] || ''}`);
+  }
+  // 2026-10-03 分级绑定动作（借鉴 pegcheck）：每个级别直接给建议动作，不只评严重度
+  if (kind !== 'resolved') {
+    const action = event.grade === 'S' && event.breadth === 'multi-chain'
+      ? '⛔ 别碰：疑似基本面事件，等慢线定性'
+      : event.grade === 'S'
+        ? '🎯 按慢线补发的最快路径执行，注意分批、确认充提开放'
+        : event.grade === 'A'
+          ? '👀 跟踪：持续观察，回到 ±0.3% 内自动解除'
+          : event.grade === 'B'
+            ? '📝 观察：暂不操作，留意是否升级'
+            : '📝 记录：无需操作';
+    lines.push(`- 建议动作：${action}`);
+  }
+  // 2026-10-03 用户要求：S 级多链联动疑似暴雷（基本面），快线必须明确这是风险警告而非套利机会；
+  // 风险提示已并入上面的"建议动作"行，这里只保留慢线补发说明。
+  if (!(event.grade === 'S' && event.breadth === 'multi-chain') && kind !== 'resolved') {
+    lines.push(`- 深化研判中：定性与套利路径随后推送（统一研判层）`);
+  } else if (kind === 'resolved') {
+    lines.push(`- 偏离已回到 ±${(DEPEG_CLEAR_BPS / 100).toFixed(2)}% 以内`);
+    lines.push(`- 事件峰值：偏离 ${Math.abs(event.peakDevBps || 0).toFixed(1)} bps；持续约 ${fmtDurMin(event.firstSeen, event.resolvedAt || new Date().toISOString())}`);
+    if (event.peakLiqUsd) lines.push(`- 期间主池流动性峰值：$${Math.round(event.peakLiqUsd).toLocaleString()}`);
+  }
+  return lines.join('\n');
+}
+
+// ============ 套利体系整合（2026-10-30）：白名单 + 入队深化 ============
+// 腿白名单（用户 2026-10-30 拍板·源白名单制，取代双源复核）：
+// 非观察源、非低置信、取价方式在名单内、主池流动性 ≥ 触发门槛（$100k）、
+// 未被抽干/占满（抽干池护栏，2026-10-30 追加），全过才有触发资格；
+// 白名单源单源触发即成立，不再要第二源验真。
+// method 'anchor'/'gecko-primary' 为深池锚腿（GeckoTerminal 主源腿流动性已在
+// 腿构建处按 $100k 复测，见 getDepegLegPrices）；'direct(low-liq)' 不在名单。
+const DEPEG_LEG_METHOD_WHITELIST = new Set(['direct', 'anchor', 'gecko-primary']);
+
+// ---- 交叉对源头换算（2026-10-30 定稿第 3 条，取代「事后双源拦截」）----
+// 以另一稳定币计价的 direct 腿（如 RLUSD/USDS、PYUSD/USDS、USDT/TUSD），其
+// USD 偏离必须先按计价币的独立 USD 锚换算：corrected = 原始对价(priceNative)
+// × 计价币 USD 锚。计价币在动（锚偏离 ≥20bps）时不换算就会把计价币的偏离
+// 算到标的头上——昨晚 RLUSD -763bps、PYUSD -138bps、USDT@Tron -58bps 三条
+// 正面样本全是这类幻影（标的在独立源上分别是 +2.4/-1/+8.2bps）。
+// 锚来源：USDT/USDC/PYUSD/RLUSD/USDG 取 Kraken USD 中间价；其余稳定币取其
+// 自身 USDT/USDC 计价腿原始对价 × Kraken 锚的中位数（priceNative 是原始对
+// 价、不含任何 USD 换算，算术精确）。锚整体取不到时整轮跳过换算（维持现
+// 状，不因 Kraken 故障致盲）；单个计价币无锚时该腿标 crossUnverified，事
+// 件照常建、由研判层 F1 分解（factsText 标注）。
+const STABLE_QUOTE_SYMBOLS = new Set(['USDT', 'USDC', 'USDS', 'USDe', 'USD1', 'PYUSD', 'RLUSD', 'USDG', 'USDD', 'U', 'TUSD', 'FDUSD', 'DAI', 'FRAX', 'GHO', 'USDP', 'CRVUSD']);
+function quoteSymbolOf(leg) {
+  const pair = String(leg?.pair || '');
+  const idx = pair.lastIndexOf('/');
+  if (idx < 0) return null;
+  const m = pair.slice(idx + 1).trim().match(/^([A-Za-z0-9]+)/);
+  return m ? m[1].toUpperCase() : null;
+}
+async function applyCrossQuoteCorrection(legs) {
+  let refs = null;
+  try {
+    const k = await krakenUsdRefs(['USDT', 'USDC', 'PYUSD', 'RLUSD', 'USDG']);
+    if (k && Object.keys(k).length) refs = { ...k };
+  } catch { refs = null; }
+  if (!refs) {
+    console.log('[depeg] 交叉锚获取失败（Kraken），本轮跳过交叉换算');
+    return;
+  }
+  const bySymbol = new Map();
+  for (const l of legs) {
+    if (isDrainedPool(l)) continue; // 抽干池幻影价不进计价锚中位数（2026-10-30）
+    const q = quoteSymbolOf(l);
+    if ((q === 'USDT' || q === 'USDC') && l.priceNative > 0 && refs[q]) {
+      if (!bySymbol.has(l.symbol)) bySymbol.set(l.symbol, []);
+      bySymbol.get(l.symbol).push(l.priceNative * refs[q]);
+    }
+  }
+  for (const [sym, vals] of bySymbol) {
+    if (refs[sym]) continue;
+    vals.sort((a, b) => a - b);
+    refs[sym] = vals[Math.floor(vals.length / 2)];
+  }
+  let corrected = 0;
+  for (const leg of legs) {
+    if ((leg.method || '') !== 'direct') continue;
+    const q = quoteSymbolOf(leg);
+    if (!q || q === leg.symbol || !STABLE_QUOTE_SYMBOLS.has(q) || !(leg.priceNative > 0)) continue;
+    leg.crossQuote = q;
+    const ref = refs[q];
+    if (ref && Math.abs(ref - 1) >= 0.002) {
+      leg.rawPrice = leg.price;
+      leg.price = leg.priceNative * ref;
+      leg.crossCorrected = { quote: q, ref: Math.round(ref * 10000) / 10000 };
+      corrected++;
+    } else if (!ref) {
+      leg.crossUnverified = q;
+    }
+  }
+  if (corrected) {
+    const moving = Object.entries(refs).filter(([, v]) => Math.abs(v - 1) >= 0.002)
+      .map(([k, v]) => `${k}=$${v.toFixed(4)}`).join(' ');
+    console.log(`[depeg] 交叉换算：${corrected} 条腿已按计价币独立 USD 锚换算（异动锚：${moving}）`);
+  }
+}
+
+// 抽干池护栏（2026-10-30 11:45 事故修补，与 $100k 薄池门槛并列）：标的占池
+// 价值 ≤5%（被买空）或 ≥95%（被卖满）时，池内剩余报价是幻影价——2026-10-30
+// 11:39 Uniswap USDS/USDT 池 USDS 占池≈0% 仍打印 +289bps、RLUSD 经 USDS 计价
+// 继承 +279bps，即源于此。此类腿只观察、不建事件；其价格也不得进交叉换算
+// 的计价锚中位数。poolImbalance 无数据（非 direct 腿）时不适用本条。
+function isDrainedPool(leg) {
+  return !!leg && leg.poolImbalance != null
+    && (leg.poolImbalance <= 5 || leg.poolImbalance >= 95);
+}
+
+function legWhitelisted(leg) {
+  if (!leg || !(leg.price > 0)) return false;
+  if (leg.observeOnly || leg.lowConfidence) return false;
+  if (!DEPEG_LEG_METHOD_WHITELIST.has(leg.method || '')) return false;
+  if (isDrainedPool(leg)) return false;
+  return (leg.liq || 0) >= DEPEG_TRIGGER_MIN_LIQ_USD;
+}
+
+// 脱锚事件入队深化研判（用户 2026-10-30 定稿：机会类先深化后推，不先推 raw）。
+// 返回 'enqueued' | 'held-soft' | 'skipped' | 'error'。
+function enqueueDepegArb(store, ev, kind) {
+  const grade = gradeLiveEvent(ev, store);
+  // 既有口径保留：USDe@Solana 单链 warn 级不推（PumpSwap 浅池滑点吃掉利润），只跟踪；
+  // 升级到 severe 才入队（与旧 pushDepegWithGrade 的 isUsdeSolSmallDisc 同口径）。
+  if (ev.symbol === 'USDe' && ev.chain === 'Solana' && ev.breadth === 'single' && ev.level !== 'severe') {
+    console.log(`[depeg] ${ev.key} USDe@Solana 单链 warn 不入队（既有口径）：${ev.devBps}bps`);
+    return 'skipped';
+  }
+  // 既有口径保留：08:00–10:00 非 S 条目软押后——留事件不入队，存续轮 10 点后补入队。
+  if (isMorningQuietHours() && grade !== 'S') return 'held-soft';
+  const titleCore = `${ev.level === 'severe' ? '🚨' : '⚠️'} ${ev.symbol}@${ev.chain} 脱锚${kind === 'escalated' ? '升级为严重' : kind === 'repush' ? '持续中' : ev.level === 'severe' ? '（严重）' : ''}`;
+  try {
+    const r = enqueueArbEvent({
+      id: `depeg:${ev.key}`,
+      type: 'depeg',
+      key: ev.key,
+      severity: (grade === 'S' || ev.level === 'severe') ? 'severe' : 'warn',
+      payload: {
+        key: ev.key, symbol: ev.symbol, chain: ev.chain, kind,
+        level: ev.level, devBps: ev.devBps, peakDevBps: ev.peakDevBps,
+        price: ev.price, liq: ev.liq, dex: ev.dex, pair: ev.pair, method: ev.method,
+        confirmSrc: ev.confirmSrc || null, confirmDevBps: ev.confirmDevBps ?? null,
+        crossQuote: ev.crossQuote || null, crossCorrected: ev.crossCorrected || null,
+        crossUnverified: ev.crossUnverified || null,
+        firstSeen: ev.firstSeen, gradeHint: grade,
+      },
+      factsText: `[${grade}] ${titleCore}\n` + formatDepegPush({ ...ev, grade }, ev.level)
+        + (ev.crossCorrected ? `\n交叉对换算：计价币 ${ev.crossCorrected.quote} 独立 USD 锚 $${ev.crossCorrected.ref}，本事件偏离已按原始对价换算为对 USD 偏离` : '')
+        + (ev.crossUnverified ? `\n交叉对提示：计价币 ${ev.crossUnverified} 无源头独立 USD 锚，交叉偏离待研判 F1 分解后再定性` : ''),
+    });
+    if (r.enqueued) console.log(`[depeg] ${ev.key} 已入队深化研判（${kind}，预评级 ${grade}）`);
+    return r.enqueued ? 'enqueued' : 'error';
+  } catch (e) {
+    console.log(`[depeg] ${ev.key} 入队失败：${e.message}`);
+    return 'error';
+  }
+}
+
+// 逐所盯跌层（cex_dip_watch）自轮询取用的最近一轮 DEX 锚腿（每次主扫描刷新）
+let lastDepegLegs = [];
+
+async function scanDepegMonitor() {
+  depegMonitorState.checkedAt = new Date().toISOString();
+  let legs;
+  try {
+    legs = await getDepegLegPrices();
+  } catch (error) {
+    depegMonitorState.lastError = error.message;
+    console.log(`[depeg] 扫描失败：${error.message}`);
+    return;
+  }
+  lastDepegLegs = legs;
+  // 交叉对源头换算（见 applyCrossQuoteCorrection）：在本轮任何建事件/定级之前
+  await applyCrossQuoteCorrection(legs);
+
+  const store = loadDepegEvents();
+  const now = Date.now();
+  const nowIso = new Date().toISOString();
+  const seen = new Set();
+
+  for (const leg of legs) {
+    const key = `${leg.symbol}:${leg.chain}`;
+    if (!leg.price) continue; // 无数据：保持原事件不动
+    seen.add(key);
+    const devBps = ((leg.price - 1) / 1) * 10_000;
+    const level = depegLevel(devBps);
+    const prev = store.events[key];
+
+    if (!level) {
+      // 回到阈值内：解除
+      if (prev && prev.status === 'active' && isCleared(devBps, DEPEG_CLEAR_BPS)) {
+        prev.status = 'resolved';
+        prev.resolvedAt = nowIso;
+        prev.clearDevBps = Math.round(devBps * 10) / 10;
+        store.history.unshift({ ...prev });
+        store.history = store.history.slice(0, 200);
+        delete store.events[key];
+        // 事件小结归档（2026-10-30）：研判实际推送过的事件消解时记入案例库（推送仍按下方既有规则，半夜只记档不推）
+        if (prev.lastPushAt) {
+          appendEpisodeSummary({ type: 'depeg', key, peakTxt: `峰值偏离 ${Math.round(prev.peakDevBps || 0)} bps`, durMin: Math.max(1, Math.round((now - new Date(prev.firstSeen).getTime()) / 60000)), volumeTxt: prev.peakLiqUsd ? `主池流动性峰值 $${Math.round(prev.peakLiqUsd).toLocaleString()}` : '' });
+        }
+        // 底层事件已解除：队列里未处理的同条目一并清掉（2026-10-30 整合）
+        try { removeFromQueue(`depeg:${key}`); } catch { /* 队列无此条目或清理失败，不阻断解除流程 */ }
+        if (!prev.grade) prev.grade = gradeLiveEvent({ ...prev, status: 'active' }, { events: {} });
+        // 2026-10-04：半夜解除也不推（不是急事），只记日志
+        if (isNightQuietHours()) {
+          console.log(`[depeg] ${key} 脱锚解除（半夜不推）`);
+        } else if (!prev.lastPushAt) {
+          // 2026-10-04：此前没推送过的事件（warn 小折价被压住等），解除也不打扰用户
+          console.log(`[depeg] ${key} 脱锚解除（此前未推送，不打扰）`);
+        } else {
+          await pushDepegWithGrade({ events: {} },
+            { ...prev, devBps, price: leg.price, status: 'active' }, 'resolved',
+            `✅ ${leg.symbol}@${leg.chain} 脱锚解除`);
+        }
+      }
+      continue;
+    }
+
+    if (!prev || prev.status !== 'active') {
+      // 白名单制（2026-10-30 用户拍板，取代双源复核）：触发腿须在白名单内
+      // （legWhitelisted：非观察源/非低置信/取价方式在名单/主池流动性 ≥ $100k），
+      // 单源触发即成立；confirmDepeg 仅作取证字段保留，不再决定建事件与否
+      // （拆除理由见 depeg_logic.mjs 注释：昨晚 USDC 事件复核源即同一交叉对，自证失效）。
+      const verdict = confirmDepeg(devBps, leg.confirmDevBps ?? null, DEPEG_WARN_BPS);
+      if (!legWhitelisted(leg)) {
+        const reason = leg.observeOnly ? '主力源为观察源（metric/降级腿，只观察不触发）'
+          : leg.lowConfidence ? '低置信腿（lenient 浅池）不触发'
+          : !DEPEG_LEG_METHOD_WHITELIST.has(leg.method || '') ? `取价方式 ${leg.method || '无'} 不在白名单`
+          : isDrainedPool(leg) ? `池子抽干/占满：标的占池价值 ${leg.poolImbalance}%（≤5% 或 ≥95%），报价为幻影价，只观察`
+          : `池子流动性 $${Math.round(leg.liq || 0)} < $${DEPEG_TRIGGER_MIN_LIQ_USD.toLocaleString()} 触发门槛，只观察`;
+        store.history.unshift({
+          key, symbol: leg.symbol, chain: leg.chain,
+          price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+          devBps: Math.round(devBps * 10) / 10, level,
+          confirmDevBps: leg.confirmDevBps === null || leg.confirmDevBps === undefined
+            ? null : Math.round(leg.confirmDevBps * 10) / 10,
+          confirmSrc: leg.confirmSrc || null,
+          firstSeen: nowIso, status: 'observe-only',
+          note: `白名单制（2026-10-30）：${reason}，仅记录不推送`,
+        });
+        store.history = store.history.slice(0, 200);
+        console.log(`[depeg] ${key} 白名单未过只观察：${devBps.toFixed(1)}bps（${reason}）`);
+        continue;
+      }
+      // 新事件照常建（半夜/早上不再压住建事件——旧 night-hold/morning-hold 门已删；
+      // 推送时点改由统一队列 isDue 静默逻辑与研判层管，2026-10-30 定稿）。
+      // 机会类不再直推：入队深化研判后才推（enqueueDepegArb）。
+      store.events[key] = {
+        key, symbol: leg.symbol, chain: leg.chain,
+        price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+        lowConfidence: Boolean(leg.lowConfidence),
+        // 池子失衡比先行指标（2026-10-03）：事件创建时的快照，供推送标注与研判定性
+        poolImbalance: leg.poolImbalance ?? null,
+        imbalanceSig: leg.imbalanceSig ?? null,
+        confirm: verdict, // 取证字段：confirmed | likely | unconfirmed（不再决定触发）
+        confirmSrc: leg.confirmSrc || null,
+        confirmDevBps: leg.confirmDevBps ?? null,
+        crossQuote: leg.crossQuote || null, // 交叉对计价币（非交叉腿为 null）
+        crossCorrected: leg.crossCorrected || null, // 已按计价币独立 USD 锚换算 {quote, ref}
+        crossUnverified: leg.crossUnverified || null, // 计价币无源头锚，待研判 F1 分解
+        whitelisted: true,
+        devBps: Math.round(devBps * 10) / 10, level,
+        peakDevBps: Math.abs(Math.round(devBps * 10) / 10),
+        peakLiqUsd: leg.liq || 0,
+        firstSeen: nowIso, lastSeen: nowIso,
+        lastPushAt: null, lastPushKind: null, lastEnqueueAt: null,
+        enriched: false, status: 'active',
+      };
+      const enq = enqueueDepegArb(store, store.events[key], 'new');
+      if (enq === 'enqueued') {
+        store.events[key].lastEnqueueAt = nowIso;
+        store.events[key].lastPushKind = 'enqueued-new';
+        store.events[key].lastEnqueuedPeakBps = store.events[key].peakDevBps;
+      }
+      continue;
+    }
+
+    // 存续事件：更新 + 去重重报
+    const escalated = prev.level === 'warn' && level === 'severe';
+    prev.lastSeen = nowIso;
+    prev.price = leg.price;
+    prev.liq = leg.liq;
+    prev.devBps = Math.round(devBps * 10) / 10;
+    prev.peakDevBps = Math.max(prev.peakDevBps || 0, Math.abs(Math.round(devBps * 10) / 10));
+    if (leg.liq) prev.peakLiqUsd = Math.max(prev.peakLiqUsd || 0, leg.liq);
+    if (escalated) prev.level = 'severe';
+    const sinceEnqueue = prev.lastEnqueueAt ? now - new Date(prev.lastEnqueueAt).getTime() : Infinity;
+    const repushMs = prev.level === 'severe' ? DEPEG_SEVERE_REPUSH_MS : DEPEG_WARN_REPUSH_MS;
+    // 白名单制（2026-10-30）：存续事件的腿跌出白名单（薄池/观察源/低置信）即停报，
+    // 只更新数据（涵盖旧口径：liq<$100k 停推、metric 只观察、存量薄池事件即时生效）。
+    // 重报改入队深化（同 id 合并更新，不重复唤起），节律改以 lastEnqueueAt 计；
+    // 半夜不再压住（入队时点由统一队列 isDue 静默逻辑管）。confirmDepeg 仅取证保留。
+    const verdictNow = confirmDepeg(devBps, leg.confirmDevBps ?? null, DEPEG_WARN_BPS);
+    prev.confirm = verdictNow;
+    prev.confirmDevBps = leg.confirmDevBps ?? null;
+    prev.crossQuote = leg.crossQuote || null;
+    prev.crossCorrected = leg.crossCorrected || null;
+    prev.crossUnverified = leg.crossUnverified || null;
+    if (!legWhitelisted(leg)) {
+      console.log(`[depeg] ${key} 存续但腿已出白名单，跳过重报：${devBps.toFixed(1)}bps liq=$${Math.round(leg.liq || 0)}`);
+    } else if (escalated || sinceEnqueue >= repushMs) {
+      // 研判去重（2026-10-30）：6 小时内研判已处理过同事件、且峰值未较上次入队
+      // 时显著放大（<1.5×）的重报不再唤起——防持续型事件每 15/30 分钟重复唤起
+      // 研判空转；升级（warn→severe）不受此限、照常入队。
+      const doneRecent = !escalated && arbDoneRecent(`depeg:${key}`, 6 * 3600e3);
+      const peakGrown = (prev.peakDevBps || 0) >= 1.5 * (prev.lastEnqueuedPeakBps || 0);
+      if (doneRecent && !peakGrown) {
+        console.log(`[depeg] ${key} 研判已处理且峰值未显著放大，跳过重复入队（峰值 ${prev.peakDevBps}bps）`);
+      } else {
+        const enq = enqueueDepegArb(store, prev, escalated ? 'escalated' : 'repush');
+        if (enq === 'enqueued') {
+          prev.lastEnqueueAt = nowIso;
+          prev.lastPushKind = escalated ? 'enqueued-escalated' : 'enqueued-repush';
+          prev.lastEnqueuedPeakBps = prev.peakDevBps;
+        }
+      }
+    }
+  }
+
+  saveDepegEvents(store);
+
+  // 交易所逐所盯跌层（cex_dip_watch.mjs，2026-10-28 方案 v3）已于当晚与本扫描
+  // 解耦：由 startCexDipPoller 在进程内自轮询（薄池/单源 10s、深池 30s，见启动
+  // 处），锚腿取本扫描最近一轮的 lastDepegLegs；其状态摘要由轮询回调维护到
+  // depegMonitorState.cexDip。此处不再同轮调用，避免 5 分钟节奏拖慢盯跌层。
+
+  depegMonitorState.lastScanAt = nowIso;
+  depegMonitorState.lastError = null;
+  depegMonitorState.activeCount = Object.keys(store.events).length;
+  console.log(`[depeg] 扫描完成：${legs.length} 条链价，活跃事件 ${depegMonitorState.activeCount}`);
+}
+
 app.use(express.json());
 
 app.get('/api/health', (_request, response) => {
@@ -3540,6 +4480,27 @@ app.get('/api/exchange-prices', async (_request, response) => {
   }
 });
 
+app.get('/api/depeg-monitor', async (_request, response) => {
+  try {
+    const store = loadDepegEvents();
+    response.json({
+      updatedAt: new Date().toISOString(),
+      enabled: DEPEG_MONITOR_ENABLED,
+      state: depegMonitorState,
+      thresholds: {
+        warnBps: DEPEG_WARN_BPS,
+        severeBps: DEPEG_SEVERE_BPS,
+        clearBps: DEPEG_CLEAR_BPS,
+        scanIntervalMs: DEPEG_SCAN_INTERVAL_MS,
+      },
+      active: Object.values(store.events),
+      history: store.history.slice(0, 50),
+    });
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
 app.get('/api/routes', async (request, response) => {
   try {
     response.json(await getRoutes(request.query));
@@ -3575,5 +4536,30 @@ app.listen(port, () => {
         notificationState.lastError = error.message;
       });
     }, A0_NOTIFICATION_INTERVAL_MS);
+    if (DEPEG_MONITOR_ENABLED) {
+      console.log(`[depeg] 脱锚监控已启动，每 ${DEPEG_SCAN_INTERVAL_MS / 1000}s 扫一轮`);
+      scanDepegMonitor().catch((error) => {
+        depegMonitorState.lastError = error.message;
+      });
+      setInterval(() => {
+        scanDepegMonitor().catch((error) => {
+          depegMonitorState.lastError = error.message;
+        });
+      }, DEPEG_SCAN_INTERVAL_MS);
+      // 2026-10-28 方案 v3 加密（用户拍板「5 分钟长了点」）：逐所盯跌层自轮询，
+      // 与上面的 5 分钟主扫描解耦——薄池/单源币 10 秒、深池币 30 秒，只拉
+      // ticker，盘口仍只在破线时拉。进程内定时器（防重叠 + 单所失败退避），
+      // 随 server.js 启停，不新增进程/cron。开关：CEX_DIP_WATCH_ENABLED=0 关闭。
+      if (process.env.CEX_DIP_WATCH_ENABLED !== '0') {
+        startCexDipPoller(
+          () => ({ legs: lastDepegLegs, sendPushplus, sendBark, enqueueArb: enqueueArbEvent }),
+          {
+            onSummary: (_tier, summary) => {
+              depegMonitorState.cexDip = { ...summary, at: new Date().toISOString() };
+            },
+          },
+        );
+      }
+    }
   }
 });

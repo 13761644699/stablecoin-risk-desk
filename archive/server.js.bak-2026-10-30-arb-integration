@@ -1,0 +1,4475 @@
+import crypto from 'crypto';
+import express from 'express';
+import fs from 'fs';
+import path from 'path';
+import {
+  DEPEG_WATCH,
+  GRADE_LABEL,
+  classifyDepeg,
+  confirmDepeg,
+  gradeDepegEvent,
+  imbalanceSignal,
+  isCleared,
+  poolImbalance,
+} from './depeg_logic.mjs';
+import { startCexDipPoller } from './cex_dip_watch.mjs';
+
+// 2026-10-11：console 加行内时间戳（depeg_service.log 排障用；下次 server.js 重启生效）
+for (const _m of ['log', 'error', 'warn']) {
+  const _orig = console[_m].bind(console);
+  console[_m] = (..._args) => _orig(`[${new Date().toISOString()}]`, ..._args);
+}
+
+const LOCAL_ENV_FILES = [
+  path.resolve('D:/desktop/币安eth/eth.env'),
+  path.resolve(process.cwd(), '.env'),
+];
+
+function loadLocalEnvFiles(files) {
+  for (const file of files) {
+    if (!fs.existsSync(file)) continue;
+    const text = fs.readFileSync(file, 'utf8');
+    for (const line of text.split(/\r?\n/)) {
+      const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (!match || line.trimStart().startsWith('#')) continue;
+      const [, key, rawValue] = match;
+      if (process.env[key]) continue;
+      process.env[key] = rawValue.trim().replace(/^['"]|['"]$/g, '');
+    }
+  }
+}
+
+loadLocalEnvFiles(
+  process.env.STABLECOIN_DASHBOARD_ENV
+    ? [process.env.STABLECOIN_DASHBOARD_ENV, ...LOCAL_ENV_FILES]
+    : LOCAL_ENV_FILES,
+);
+
+const app = express();
+const port = Number(process.env.PORT || 8787);
+
+const LLAMA_STABLECOINS_URL =
+  'https://stablecoins.llama.fi/stablecoins?includePrices=true';
+const LIFI_BASE = 'https://li.quest/v1';
+
+const WATCH_SYMBOLS = [
+  'USDT',
+  'USDC',
+  'USDS',
+  'USDE',
+  'SUSDE',
+  'USD1',
+  'U',
+  'PYUSD',
+  'FDUSD',
+  'FRAX',
+  'FRXUSD',
+  'GHO',
+  'CRVUSD',
+  'AUSD',
+  'RLUSD',
+  'TUSD',
+  'USDD',
+  'USDG',
+  'USDY',
+  'M',
+  'DOLA',
+  'MIM',
+  'BOLD',
+  'USDP',
+];
+// 2026-10-03：DAI 从监控范围剔除（用户明确不要）；新增 USD1、U（United Stables）
+
+const PRIORITY_SYMBOLS = new Set(WATCH_SYMBOLS);
+const PINNED_SYMBOLS = new Map(
+  WATCH_SYMBOLS.map((symbol, index) => [symbol, index]),
+);
+const HIDDEN_STABLE_SYMBOLS = new Set(['USD0', 'USD0++']);
+const MIN_DISPLAY_SUPPLY = 100_000_000;
+const NAV_STYLE_STABLE_SYMBOLS = new Set([
+  'BUIDL',
+  'OUSG',
+  'TBILL',
+  'USDY',
+  'USYC',
+  'WUSDM',
+  'YLDS',
+]);
+const REDEMPTION_A0_BLOCKLIST = new Set([
+  'sUSDe',
+  'sDAI',
+  'sUSDS',
+  'sfrxUSD',
+  'syrupUSDC',
+  'syrupUSDT',
+  'PT-sUSDe',
+  'PT-USDe',
+  'PT-sUSDS',
+  'PT-sfrxUSD',
+  'stETH',
+  'wstETH',
+  'rETH',
+  'sfrxETH',
+]);
+const MIN_EXCHANGE_QUOTE_VOLUME = 100_000;
+const BINANCE_EXECUTION_BASE_SIZES = new Map([
+  ['BETHETH', 1],
+  ['WBETHETH', 1],
+  ['BNSOLSOL', 10],
+]);
+const CORE_REDEMPTION_SYMBOLS = new Set([
+  'sUSDe',
+  'sDAI',
+  'sUSDS',
+  'sfrxUSD',
+  'PT-sUSDe',
+  'PT-USDe',
+  'PT-sUSDS',
+  'syrupUSDC',
+  'syrupUSDT',
+  'stETH',
+  'wstETH',
+  'rETH',
+  'sfrxETH',
+]);
+const A0_NOTIFICATION_INTERVAL_MS = Number(process.env.A0_NOTIFICATION_INTERVAL_MS || 60_000);
+const A0_NOTIFICATION_COOLDOWN_MS = Number(process.env.A0_NOTIFICATION_COOLDOWN_MS || 30 * 60_000);
+
+const ROUTE_TOKENS = ['USDC', 'USDT', 'USD1', 'FRAX', 'USDE', 'SUSDE'];
+// 2026-10-03：DAI -> USD1（用户不要 DAI）
+const EXCHANGE_STABLE_MARKETS = [
+  { exchange: 'Binance', symbol: 'USDC', pair: 'USDCUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'FDUSD', pair: 'FDUSDUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'USDe', pair: 'USDEUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'USDS', pair: 'USDSUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'TUSD', pair: 'TUSDUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'USDP', pair: 'USDPUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'USD1', pair: 'USD1USDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'Binance', symbol: 'RLUSD', pair: 'RLUSDUSDT', quote: 'USDT', type: 'binance' },
+  { exchange: 'OKX', symbol: 'USDC', pair: 'USDC-USDT', quote: 'USDT', type: 'okx' },
+  { exchange: 'OKX', symbol: 'PYUSD', pair: 'PYUSD-USDT', quote: 'USDT', type: 'okx' },
+  { exchange: 'OKX', symbol: 'USDS', pair: 'USDS-USDT', quote: 'USDT', type: 'okx' },
+  { exchange: 'OKX', symbol: 'USDT', pair: 'USDT-USD', quote: 'USD', type: 'okx' },
+  { exchange: 'Gate', symbol: 'USDC', pair: 'USDC_USDT', quote: 'USDT', type: 'gate' },
+  { exchange: 'Gate', symbol: 'FDUSD', pair: 'FDUSD_USDT', quote: 'USDT', type: 'gate' },
+  { exchange: 'Gate', symbol: 'PYUSD', pair: 'PYUSD_USDT', quote: 'USDT', type: 'gate' },
+  { exchange: 'Gate', symbol: 'USDe', pair: 'USDE_USDT', quote: 'USDT', type: 'gate' },
+  { exchange: 'Gate', symbol: 'USDS', pair: 'USDS_USDT', quote: 'USDT', type: 'gate' },
+  { exchange: 'Gate', symbol: 'TUSD', pair: 'TUSD_USDT', quote: 'USDT', type: 'gate' },
+  { exchange: 'Gate', symbol: 'USDP', pair: 'USDP_USDT', quote: 'USDT', type: 'gate' },
+  { exchange: 'Coinbase', symbol: 'USDT', pair: 'USDT-USD', quote: 'USD', type: 'coinbase' },
+];
+const EXCHANGE_REDEMPTION_MARKETS = [
+  { exchange: 'Binance', symbol: 'BETH', pair: 'BETHETH', quote: 'ETH', type: 'binance' },
+  { exchange: 'Binance', symbol: 'WBETH', pair: 'WBETHETH', quote: 'ETH', type: 'binance' },
+  { exchange: 'Binance', symbol: 'BNSOL', pair: 'BNSOLSOL', quote: 'SOL', type: 'binance' },
+];
+const CHAIN_SPREAD_SYMBOLS = [
+  'USDC',
+  'USDT',
+  'USD1',
+  'U',
+  'USDS',
+  'FDUSD',
+  'USDE',
+  'SUSDE',
+  'PYUSD',
+  'FRAX',
+  'GHO',
+  'crvUSD',
+  'AUSD',
+];
+// 2026-10-03：剔除 DAI，新增 USD1、U
+const CHAIN_SPREAD_ALERT_BPS = 10;
+const CHAIN_SPREAD_PRICE_BAND = [0.985, 1.015];
+const CANONICAL_TOKEN_ADDRESSES = new Map([
+  ['1:USDC', '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'],
+  ['8453:USDC', '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'],
+  ['42161:USDC', '0xaf88d065e77c8cC2239327C5EDb3A432268e5831'],
+  ['10:USDC', '0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85'],
+  ['137:USDC', '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359'],
+  ['43114:USDC', '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E'],
+  ['56:USDC', '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d'],
+  ['59144:USDC', '0x176211869cA2b568f2A7D4EE941E073a821EE1ff'],
+  ['1:USDT', '0xdAC17F958D2ee523a2206206994597C13D831ec7'],
+  ['8453:USDT', '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2'],
+  ['42161:USDT', '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9'],
+  ['10:USDT', '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58'],
+  ['137:USDT', '0xc2132D05D31c914a87C6611C10748AEb04B58e8F'],
+  ['43114:USDT', '0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7'],
+  ['56:USDT', '0x55d398326f99059fF775485246999027B3197955'],
+  ['59144:USDT', '0xA219439258ca9da29E9Cc4cE5596924745e12B93'],
+  ['1:DAI', '0x6B175474E89094C44Da98b954EedeAC495271d0F'],
+  ['8453:DAI', '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb'],
+  ['42161:DAI', '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1'],
+  ['10:DAI', '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1'],
+  ['137:DAI', '0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063'],
+  ['43114:DAI', '0xd586E7F844cEa2F87f50152665BCbc2C279D8d70'],
+  ['56:DAI', '0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3'],
+  ['59144:DAI', '0x4AF15ec2A0BD43Db75dd04E62FAA3B8EF36b00d5'],
+  ['1:USDS', '0xdC035D45d973E3EC169d2276DDab16f1e407384F'],
+  ['8453:USDS', '0x820C137fa70C8691f0e44Dc420a5e53c168921Dc'],
+  ['42161:USDS', '0x6491c05A82219b8D1479057361ff1654749b876b'],
+  ['1:FDUSD', '0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409'],
+  ['42161:FDUSD', '0xFf044A50A41cD65fedE219f4B8762D88505D30DA'],
+  ['56:FDUSD', '0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409'],
+  ['1:USDE', '0x4c9EDD5852cd905f086C759E8383e09bff1E68B3'],
+  ['8453:USDE', '0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34'],
+  ['42161:USDE', '0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34'],
+  ['10:USDE', '0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34'],
+  ['43114:USDE', '0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34'],
+  ['56:USDE', '0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34'],
+  ['59144:USDE', '0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34'],
+  ['1:SUSDE', '0x9D39A5DE30e57443BfF2A8307A4256c8797A3497'],
+  ['8453:SUSDE', '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2'],
+  ['42161:SUSDE', '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2'],
+  ['10:SUSDE', '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2'],
+  ['43114:SUSDE', '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2'],
+  ['56:SUSDE', '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2'],
+  ['59144:SUSDE', '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2'],
+  ['1:PYUSD', '0x6c3ea9036406852006290770BEdFcAbA0e23A0e8'],
+  ['42161:PYUSD', '0x46850aD61C2B7d64d08c9C754F45254596696984'],
+  ['1:FRAX', '0x853d955aCEf822Db058eb8505911ED77F175b99e'],
+  ['8453:FRAX', '0x909DBdE1eBE906Af95660033e478D59EFe831fED'],
+  ['42161:FRAX', '0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F'],
+  ['10:FRAX', '0x2E3D870790dC77A83DD1d18184Acc7439A53f475'],
+  ['137:FRAX', '0x45c32fA6DF82ead1e2EF74d17b76547EDdFaFF89'],
+  ['43114:FRAX', '0xD24C2Ad096400B6FBcd2ad8B24E7acBc21A1da64'],
+  ['56:FRAX', '0x90C97F71E18723b0Cf0dfa30ee176Ab653E89F40'],
+  ['1:GHO', '0x40D16FC0246aD3160Ccc09B8D0D3A2cD28aE6C2f'],
+  ['8453:GHO', '0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee'],
+  ['42161:GHO', '0x7dfF72693f6A4149b17e7C6314655f6A9F7c8B33'],
+  ['43114:GHO', '0xfc421aD3C883Bf9E7C4f42dE845C4e4405799e73'],
+  ['1:CRVUSD', '0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E'],
+  ['8453:CRVUSD', '0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93'],
+  ['42161:CRVUSD', '0x498Bf2B1e120FeD3ad3D42EA2165E9b73f99C1e5'],
+  ['10:CRVUSD', '0xC52D7F23a2e460248Db6eE192Cb23dD12bDDCbf6'],
+  ['137:CRVUSD', '0xc4Ce1D6F5D98D65eE25Cf85e9F2E9DcFEe6Cb5d6'],
+  ['1:AUSD', '0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a'],
+  ['8453:AUSD', '0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a'],
+  ['42161:AUSD', '0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a'],
+  ['137:AUSD', '0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a'],
+  ['56:AUSD', '0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a'],
+]);
+const CORE_CHAIN_IDS = [1, 8453, 42161, 10, 137, 43114, 56, 59144, 130, 480];
+const REDEMPTION_CHAIN_IDS = [
+  ...new Set([...CORE_CHAIN_IDS, 1151111081099710]),
+];
+const RPC_URLS = new Map([
+  [1, 'https://ethereum-rpc.publicnode.com'],
+  [8453, 'https://base-rpc.publicnode.com'],
+  [42161, 'https://arbitrum-one-rpc.publicnode.com'],
+  [10, 'https://optimism-rpc.publicnode.com'],
+  [56, 'https://bsc-rpc.publicnode.com'],
+  [100, 'https://gnosis-rpc.publicnode.com'],
+]);
+const ERC4626_CONVERT_TO_ASSETS_SELECTOR = '0x07a2d13a';
+const CHAINLINK_LATEST_ANSWER_SELECTOR = '0x50d25bcd';
+const PENDLE_MARKETS_URL = 'https://api-v2.pendle.finance/core/v1/1/markets/active';
+const HASHNOTE_USYC_PRICE_URL = 'https://usyc.hashnote.com/api/price-reports';
+const JUPITER_QUOTE_URL = 'https://lite-api.jup.ag/swap/v1/quote';
+const COINGECKO_SIMPLE_PRICE_URL = 'https://api.coingecko.com/api/v3/simple/price';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const SOL_LST_MINTS = new Map([
+  ['mSOL', { mint: 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', decimals: 9 }],
+  ['JitoSOL', { mint: 'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', decimals: 9 }],
+  ['JupSOL', { mint: 'jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v', decimals: 9 }],
+  ['bSOL', { mint: 'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1', decimals: 9 }],
+  ['infSOL', { mint: 'iNF7jHABB8ebDoshfwLSwJhsNH5NoKhBpdj6J8tztey', decimals: 9 }],
+]);
+const COINGECKO_ETH_REFERENCES = new Map([
+  [
+    'ankrETH',
+    {
+      id: 'ankreth',
+      label: '按 CoinGecko ankrETH/ETH 公开报价估算退出参考；执行前仍需确认 Ankr unstake 规则',
+    },
+  ],
+]);
+const BINANCE_SIGNED_RATE_ENDPOINTS = new Map([
+  [
+    'WBETH',
+    {
+      path: '/sapi/v1/eth-staking/eth/history/rateHistory',
+      label: '按 Binance SAPI WBETH rateHistory 官方签名接口读取兑换率',
+    },
+  ],
+  [
+    'BNSOL',
+    {
+      path: '/sapi/v1/sol-staking/sol/history/rateHistory',
+      label: '按 Binance SAPI BNSOL rateHistory 官方签名接口读取兑换率',
+    },
+  ],
+]);
+const REDEMPTION_WAIT_DAYS = new Map([
+  ['sUSDe', 7],
+  ['sDAI', 1],
+  ['sUSDS', 1],
+  ['sfrxUSD', 1],
+  ['syrupUSDC', 14],
+  ['syrupUSDT', 14],
+  ['stETH', 5],
+  ['wstETH', 5],
+  ['rETH', 1],
+  ['sfrxETH', 1],
+  ['PT-sUSDe', 96],
+  ['PT-USDe', 96],
+  ['PT-sUSDS', 47],
+  ['PT-sfrxUSD', 96],
+]);
+const MANUAL_REDEMPTION_RATES = new Map([]);
+const CONSERVATIVE_PRICING_POLICIES = new Map([
+  ['USDY', 'Ondo 申赎需要资格、地区和窗口确认，公开 NAV 不进入可执行复核项'],
+  ['OUSG', 'Ondo OUSG 需要白名单和工作日结算，公开 NAV 不进入可执行复核项'],
+  ['USYC', 'Hashnote/Circle 赎回需要账户权限和结算流程，公开 NAV 不进入可执行复核项'],
+  ['wUSDM', 'Mountain/USDM 赎回涉及地区与 KYC 权限，先观察不进入 A0/A1 复核'],
+  ['frxETH', 'frxETH 退出依赖 Frax/Curve 流动性，1:1 目标价不进入 A0/A1 复核'],
+  ['cbETH', 'Chainlink cbETH/ETH 是估值参考，不等于 Coinbase 可赎回报价'],
+  ['ezETH', 'Chainlink ezETH/ETH 是估值参考，Renzo 退出窗口和额度需另查'],
+  ['rsETH', 'Chainlink rsETH/ETH 是估值参考，Kelp 退出窗口和底层资产需另查'],
+  ['mETH', 'Chainlink mETH/ETH 是估值参考，Mantle 赎回窗口需另查'],
+  ['osETH', 'Chainlink osETH/ETH 是估值参考，StakeWise vault 退出状态需另查'],
+  ['pufETH', 'pufETH 汇率可链上读取，但 native withdrawal 队列时间和额度未实时接入，先观察不进入 A0/A1 复核'],
+  ['swETH', 'swETH 汇率可链上读取，但退出队列时间和额度未实时接入，先观察不进入 A0/A1 复核'],
+  ['ankrETH', 'CoinGecko ankrETH/ETH 是公开价格参考，不等于 Ankr 可赎回报价'],
+  ['mSOL', 'Jupiter 小额路由是 swap 出口，不等于 Marinade 协议赎回价'],
+  ['JitoSOL', 'Jupiter 小额路由是 swap 出口，不等于 Jito 协议赎回价'],
+  ['JupSOL', 'Jupiter 小额路由是 swap 出口，不等于 Jupiter LST 协议赎回价'],
+  ['bSOL', 'Jupiter 小额路由是 swap 出口，不等于 BlazeStake 协议赎回价'],
+  ['infSOL', 'infSOL 公开路由流动性不足，不能按市场参考计算可执行复核项'],
+  ['LBTC', 'Chainlink LBTC/BTC 是估值参考，Lombard 赎回涉及白名单和托管流程'],
+  ['SolvBTC', 'Chainlink SolvBTC/BTC 是估值参考，Solv 赎回路径和额度需另查'],
+  ['SolvBTC.BBN', 'Chainlink SolvBTC.BBN/SolvBTC 是估值参考，Babylon 解锁/退出周期需另查'],
+  ['pumpBTC', 'pumpBTC 当前按人工目标价观察，必须确认官方赎回窗口和托管状态'],
+  ['YT/PT RWA', 'Pendle RWA/PT 必须选具体市场、底层和到期日，聚合项不进入 A0/A1 复核'],
+]);
+const STATIC_REDEMPTION_REFERENCE_OVERRIDES = new Map([
+  [
+    'USDY',
+    {
+      value: 1.13,
+      quality: '公开价格参考',
+      label: 'Ondo 官方 NAV 接口当前会拦截本地请求；先用公开市场/NAV 参考值估算 USDY 赎回单位',
+    },
+  ],
+  [
+    'OUSG',
+    {
+      value: 111.5,
+      quality: '公开价格参考',
+      label: 'Ondo OUSG 需白名单/官方 NAV 确认；先用公开 NAV 参考值估算赎回单位',
+    },
+  ],
+  [
+    'pumpBTC',
+    {
+      value: 1,
+      quality: '人工参考',
+      label: 'pumpBTC 目标赎回单位按 1 BTC 参考；执行前必须确认官方赎回窗口、额度和托管状态',
+    },
+  ],
+  [
+    'YT/PT RWA',
+    {
+      value: 1,
+      quality: '人工参考',
+      label: 'Pendle RWA/PT 按到期赎回 1 单位底层资产参考；需选择具体市场核对到期日和流动性',
+    },
+  ],
+]);
+const ERC4626_REFERENCE_OVERRIDES = new Map([
+  [
+    'sfrxUSD',
+    {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xcf62F905562626CfcDD2261162a51fd02Fc9c5b6',
+      decimals: 18,
+      quote: 'frxUSD',
+      label: '按 Frax sfrxUSD ERC-4626 convertToAssets(1 sfrxUSD) 估算可赎回 frxUSD 数量',
+    },
+  ],
+  [
+    'sUSDS',
+    {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD',
+      decimals: 18,
+      quote: 'USDS',
+      label: '按 Sky sUSDS ERC-4626 convertToAssets(1 sUSDS) 估算赎回 USDS',
+    },
+  ],
+  [
+    'syrupUSDC',
+    {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x80ac24aA929eaF5013f6436cdA2a7ba190f5Cc0b',
+      decimals: 6,
+      quote: 'USDC',
+      label: '按 ERC-4626 convertToAssets(1 syrupUSDC) 估算赎回 USDC',
+    },
+  ],
+  [
+    'syrupUSDT',
+    {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x356b8d89c1e1239cbbb9de4815c39a1474d5ba7d',
+      decimals: 6,
+      quote: 'USDT',
+      label: '按 Maple syrupUSDT ERC-4626 convertToAssets(1 syrupUSDT) 估算赎回 USDT',
+    },
+  ],
+  [
+    'wUSDM',
+    {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x57F5E098CaD7A3D1Eed53991D4d66C45C9AF7812',
+      decimals: 18,
+      quote: 'USDM',
+      label: '按 ERC-4626 convertToAssets(1 wUSDM) 估算 unwrap 后 USDM',
+    },
+  ],
+  [
+    'sfrxETH',
+    {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xac3E018457B222d93114458476f3E3416Abbe38F',
+      decimals: 18,
+      quote: 'frxETH',
+      label: '按 Frax sfrxETH ERC-4626 convertToAssets(1 sfrxETH) 估算可换回 frxETH 数量；frxETH 再退出 ETH 需看 Frax/Curve 流动性',
+    },
+  ],
+]);
+const CONTRACT_REFERENCE_OVERRIDES = new Map([
+  [
+    'cbETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0xF017fcB346A1885194689bA23Eff2fE6fA5C483b',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Chainlink cbETH/ETH 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'ezETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0x636A000262F6aA9e1F094ABF0aD8f645C44f641C',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Chainlink ezETH/ETH 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'rsETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0x9d2F2f96B24C444ee32E57c04F7d944bcb8c8549',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Chainlink rsETH/ETH Exchange Rate 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'mETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0x5b563107C8666d2142C216114228443B94152362',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Chainlink mETH/ETH 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'osETH',
+    {
+      type: 'contract',
+      chainId: 100,
+      address: '0xc5f7665e7FdC5059B93Db8bEAB83F5ffA05Eb18e',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Chainlink osETH/ETH Exchange Rate 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'LBTC',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0x5c29868C58b6e15e2b962943278969Ab6a7D3212',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 8,
+      quote: 'BTC',
+      label: '按 Chainlink LBTC/BTC 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'SolvBTC',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0x4e25cfdc5f53c2CdeD13c1472E628eFd35c99C83',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 18,
+      quote: 'BTC',
+      label: '按 Chainlink SOLVBTC/BTC Exchange Rate 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'SolvBTC.BBN',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0x1f34794A16D644b9810477EbF3f0b3870141E2e3',
+      selector: CHAINLINK_LATEST_ANSWER_SELECTOR,
+      decimals: 18,
+      quote: 'BTC',
+      label: '按 Chainlink SolvBTC.BBN/SolvBTC Exchange Rate 数据源读取独立兑换率参考',
+    },
+  ],
+  [
+    'wstETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0',
+      selector: '0x035faf82',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 wstETH stEthPerToken() 链上汇率估算 unwrap 后 stETH/ETH',
+    },
+  ],
+  [
+    'rETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0xae78736Cd615f374D3085123A210448E74Fc6393',
+      selector: '0xe6aa216c',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Rocket Pool rETH getExchangeRate() 链上汇率估算赎回 ETH',
+    },
+  ],
+  [
+    'weETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee',
+      selector: '0x679aefce',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 weETH getRate() 链上汇率估算 unwrap/退出 ETH',
+    },
+  ],
+  [
+    'pufETH',
+    {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xD9A442856C234a39a81a089C06451EBAa4306a72',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 ERC-4626 convertToAssets(1 pufETH) 估算退出 ETH',
+    },
+  ],
+  [
+    'swETH',
+    {
+      type: 'contract',
+      chainId: 1,
+      address: '0xf951E335afb289353dc249e82926178EaC7DEd78',
+      selector: '0x679aefce',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 swETH getRate() 链上汇率估算退出 ETH',
+    },
+  ],
+]);
+const YIELD_ASSETS = [
+  {
+    symbol: 'sUSDe',
+    name: 'Staked USDe',
+    note: 'Ethena 收益型 USDe 凭证，不按 1 美元脱锚判断',
+    tokens: [
+      { chainId: 1, address: '0x9D39A5DE30e57443BfF2A8307A4256c8797A3497' },
+      { chainId: 8453, address: '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2' },
+      { chainId: 42161, address: '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2' },
+      { chainId: 10, address: '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2' },
+      { chainId: 56, address: '0x211Cc4DD073734dA055fbF44a2b4667d5E5fE5d2' },
+    ],
+  },
+  {
+    symbol: 'sUSDS',
+    name: 'Savings USDS',
+    note: 'Sky Savings USDS，收益型资产，价格不应简单按 1 美元脱锚判断',
+    tokens: [
+      { chainId: 1, address: '0xa3931d71877C0E7a3148fC58fEfeBAbC8fA30404' },
+      { chainId: 8453, address: '0x5875eEE11Cf8398102FdAd704C9E96607675467a' },
+    ],
+  },
+];
+
+const REDEMPTION_ASSETS = [
+  {
+    symbol: 'sUSDe',
+    name: 'Ethena Staked USDe',
+    kind: '收益型稳定币',
+    source: 'DeFiLlama / Ethena',
+    market: { type: 'llama', chainId: 1, address: '0x9D39A5DE30e57443BfF2A8307A4256c8797A3497' },
+    reference: { type: 'manual', value: 1.2298, label: 'sUSDe -> USDe 赎回参考' },
+    redemptionPath: [
+      '进入 Ethena App',
+      'sUSDe unstake / cooldown',
+      '冷却结束后领取 USDe',
+      'USDe 在 Curve/DEX/CEX 换成 USDC/USDT',
+    ],
+    wait: '通常有冷却期，具体以 Ethena 页面为准',
+    entryUrl: 'https://app.ethena.fi/',
+  },
+  {
+    symbol: 'sUSDS',
+    name: 'Sky Savings USDS',
+    kind: '收益型稳定币',
+    source: 'DeFiLlama / Sky',
+    market: { type: 'llama', chainId: 8453, address: '0x5875eEE11Cf8398102FdAd704C9E96607675467a' },
+    reference: { type: 'same-as-market', label: '按 Sky/Savings 兑换率赎回 USDS' },
+    redemptionPath: [
+      '进入 Sky App',
+      'sUSDS withdraw / unwrap',
+      '获得 USDS',
+      'USDS 在 DEX 或 CEX 换成 USDC/USDT',
+    ],
+    wait: '通常即时或按协议状态处理',
+    entryUrl: 'https://app.sky.money/',
+  },
+  {
+    symbol: 'BETH',
+    name: 'Binance Beacon ETH',
+    kind: '中心化质押凭证',
+    source: 'Binance ticker',
+    market: { type: 'binance', pair: 'BETHETH', quote: 'ETH' },
+    reference: { type: 'manual', value: 1, label: 'Binance BETH -> ETH 赎回参考 1:1' },
+    redemptionPath: [
+      '进入 Binance Earn / ETH Staking',
+      '选择 Redeem BETH',
+      '等待 Binance 与以太坊提款队列处理',
+      '到账 ETH 后可现货卖出',
+    ],
+    wait: '可能有每日额度和排队时间，以 Binance 页面为准',
+    entryUrl: 'https://www.binance.com/en/earn/eth-staking',
+  },
+  {
+    symbol: 'WBETH',
+    name: 'Wrapped Binance ETH',
+    kind: '中心化质押凭证',
+    source: 'Binance ticker',
+    market: { type: 'binance', pair: 'WBETHETH', quote: 'ETH' },
+    reference: { type: 'binance-market', pair: 'WBETHETH', label: 'WBETH 兑换率需以 Binance 质押页面为准' },
+    redemptionPath: [
+      '进入 Binance ETH Staking / WBETH',
+      '按页面兑换率 redeem 或 unwrap',
+      '获得 ETH',
+      '如急用可直接卖 WBETH/ETH',
+    ],
+    wait: '兑换率随奖励累计变化，赎回时间以 Binance 页面为准',
+    entryUrl: 'https://www.binance.com/en/earn/eth-staking',
+  },
+  {
+    symbol: 'BNSOL',
+    name: 'Binance Staked SOL',
+    kind: '中心化质押凭证',
+    source: 'Binance ticker',
+    market: { type: 'binance', pair: 'BNSOLSOL', quote: 'SOL' },
+    reference: { type: 'binance-market', pair: 'BNSOLSOL', label: 'BNSOL/SOL 赎回兑换率需以 Binance 页面为准' },
+    redemptionPath: [
+      '进入 Binance SOL Staking',
+      '选择 Redeem BNSOL',
+      '按当前 BNSOL/SOL conversion rate 赎回 SOL',
+      '等待处理完成后获得 SOL',
+    ],
+    wait: '兑换率周期性更新，赎回处理可能需要数日',
+    entryUrl: 'https://www.binance.com/en/sol-staking',
+  },
+  {
+    symbol: 'stETH',
+    name: 'Lido Staked ETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Lido',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'stETH' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'Lido stETH -> ETH 提款参考接近 1:1' },
+    redemptionPath: ['进入 Lido', 'Request withdrawals', '等待以太坊退出队列', '领取 ETH'],
+    wait: '通常需要等待退出队列，具体以 Lido 页面为准',
+    entryUrl: 'https://stake.lido.fi/withdrawals',
+  },
+  {
+    symbol: 'wstETH',
+    name: 'Wrapped stETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Lido',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'wstETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: '需先 unwrap 为 stETH，再按 Lido 兑换率提现 ETH' },
+    redemptionPath: ['unwrap wstETH -> stETH', '进入 Lido withdrawals', '等待退出队列', '领取 ETH'],
+    wait: 'wstETH/stETH 汇率随奖励累计变化',
+    entryUrl: 'https://stake.lido.fi/withdrawals',
+  },
+  {
+    symbol: 'rETH',
+    name: 'Rocket Pool ETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Rocket Pool',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'rETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'rETH/ETH 官方兑换率需以 Rocket Pool 为准' },
+    redemptionPath: ['进入 Rocket Pool', 'swap/redeem rETH', '协议池有流动性则即时换 ETH', '否则走二级市场'],
+    wait: '受 Rocket Pool 存款池流动性影响',
+    entryUrl: 'https://stake.rocketpool.net/',
+  },
+  {
+    symbol: 'cbETH',
+    name: 'Coinbase Wrapped Staked ETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Coinbase',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'cbETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'cbETH 赎回汇率需以 Coinbase 为准' },
+    redemptionPath: ['进入 Coinbase', 'unwrap/redeem cbETH', '获得 ETH', '或在链上/交易所卖出 cbETH'],
+    wait: '受 Coinbase 赎回规则影响',
+    entryUrl: 'https://www.coinbase.com/',
+  },
+  {
+    symbol: 'frxETH',
+    name: 'Frax Ether',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Frax',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'frxETH' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'frxETH 目标兑换参考接近 1 ETH' },
+    redemptionPath: ['进入 Frax', 'frxETH/sfrxETH 相关兑换或退出', '换回 ETH 或 Curve 池退出'],
+    wait: '需看 Frax/Curve 流动性与协议出口',
+    entryUrl: 'https://app.frax.finance/',
+  },
+  {
+    symbol: 'sfrxETH',
+    name: 'Staked Frax Ether',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Frax',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'sfrxETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'sfrxETH 先换 frxETH，兑换率随收益变化' },
+    redemptionPath: ['sfrxETH withdraw -> frxETH', 'frxETH 通过 Frax/Curve 退出 ETH'],
+    wait: '兑换率随收益累计变化',
+    entryUrl: 'https://app.frax.finance/',
+  },
+  {
+    symbol: 'weETH',
+    name: 'Wrapped eETH',
+    kind: 'ETH LRT/LST',
+    source: 'LI.FI token price / ether.fi',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'weETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'weETH/eETH 兑换率需以 ether.fi 为准' },
+    redemptionPath: ['unwrap weETH -> eETH', '进入 ether.fi unstake', '等待退出', '领取 ETH'],
+    wait: '退出时间受协议和以太坊队列影响',
+    entryUrl: 'https://app.ether.fi/',
+  },
+  {
+    symbol: 'eETH',
+    name: 'ether.fi ETH',
+    kind: 'ETH LRT/LST',
+    source: 'LI.FI token price / ether.fi',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'eETH' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'eETH 目标兑换参考接近 1 ETH' },
+    redemptionPath: ['进入 ether.fi', 'unstake eETH', '等待退出', '领取 ETH'],
+    wait: '退出时间受协议和以太坊队列影响',
+    entryUrl: 'https://app.ether.fi/',
+  },
+  {
+    symbol: 'ezETH',
+    name: 'Renzo Restaked ETH',
+    kind: 'ETH LRT',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'ezETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'ezETH 赎回率需以 Renzo 为准' },
+    redemptionPath: ['进入 Renzo', 'withdraw/unstake ezETH', '等待退出', '领取 ETH 或等价资产'],
+    wait: '受 Renzo 退出窗口影响',
+    entryUrl: 'https://app.renzoprotocol.com/',
+  },
+  {
+    symbol: 'rsETH',
+    name: 'Kelp rsETH',
+    kind: 'ETH LRT',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'rsETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'rsETH 赎回率需以 Kelp 为准' },
+    redemptionPath: ['进入 Kelp DAO', 'withdraw rsETH', '等待退出', '领取底层资产'],
+    wait: '受 Kelp 退出机制影响',
+    entryUrl: 'https://kelpdao.xyz/',
+  },
+  {
+    symbol: 'mETH',
+    name: 'Mantle Staked Ether',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'mETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'mETH 赎回率需以 Mantle 为准' },
+    redemptionPath: ['进入 Mantle mETH', 'unstake/redeem mETH', '等待退出', '领取 ETH'],
+    wait: '以 Mantle 页面为准',
+    entryUrl: 'https://meth.mantle.xyz/',
+  },
+  {
+    symbol: 'osETH',
+    name: 'StakeWise osETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'osETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'osETH 退出需看 StakeWise vault' },
+    redemptionPath: ['进入 StakeWise', '选择对应 vault', 'burn/exit osETH', '领取 ETH'],
+    wait: '受对应 vault 和退出队列影响',
+    entryUrl: 'https://app.stakewise.io/',
+  },
+  {
+    symbol: 'mSOL',
+    name: 'Marinade Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Marinade',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'mSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'mSOL/SOL 赎回率需以 Marinade 为准' },
+    redemptionPath: ['进入 Marinade', 'unstake mSOL', '选择 delayed unstake 或 liquidity unstake', '领取 SOL'],
+    wait: '延迟赎回通常需等待 epoch；即时退出取决于流动性',
+    entryUrl: 'https://marinade.finance/app/',
+  },
+  {
+    symbol: 'JitoSOL',
+    name: 'Jito Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Jito',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'JitoSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'JitoSOL/SOL 赎回率需以 Jito 为准' },
+    redemptionPath: ['进入 Jito', 'unstake JitoSOL', '等待 epoch 或走流动性退出', '领取 SOL'],
+    wait: '通常受 Solana epoch 和流动性影响',
+    entryUrl: 'https://www.jito.network/',
+  },
+  {
+    symbol: 'JupSOL',
+    name: 'Jupiter Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Jupiter',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'JupSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'JupSOL/SOL 赎回率需以 Jupiter 为准' },
+    redemptionPath: ['进入 Jupiter LST', 'unstake JupSOL', '等待或通过流动性退出', '领取 SOL'],
+    wait: '以 Jupiter 页面为准',
+    entryUrl: 'https://jup.ag/',
+  },
+  {
+    symbol: 'bSOL',
+    name: 'BlazeStake Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / BlazeStake',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'bSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'bSOL/SOL 赎回率需以 BlazeStake 为准' },
+    redemptionPath: ['进入 BlazeStake', 'unstake bSOL', '等待 epoch 或流动性退出', '领取 SOL'],
+    wait: '通常受 Solana epoch 影响',
+    entryUrl: 'https://stake.solblaze.org/',
+  },
+  {
+    symbol: 'stSOL',
+    name: 'Lido Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'stSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'stSOL 为历史 LST，退出路径需谨慎确认' },
+    redemptionPath: ['确认官方/市场退出路径', '优先检查 DEX 流动性', '避免按过期规则估算'],
+    wait: '历史资产，需人工确认',
+    entryUrl: 'https://jup.ag/',
+  },
+  {
+    symbol: 'PT-sUSDe',
+    name: 'Pendle PT sUSDe',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle / 需按具体到期日',
+    market: { type: 'manual', price: 0 },
+    reference: { type: 'manual', value: 1, quote: 'USDe/sUSDe', label: 'PT 到期后可按 1:1 赎回底层资产，需区分到期日' },
+    redemptionPath: ['进入 Pendle', '选择对应 PT 市场和到期日', '到期后 Redeem PT', '获得底层资产'],
+    wait: '必须等到期；不同到期日价差不同',
+    entryUrl: 'https://app.pendle.finance/',
+  },
+  {
+    symbol: 'PT-USDe',
+    name: 'Pendle PT USDe',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle / 需按具体到期日',
+    market: { type: 'manual', price: 0 },
+    reference: { type: 'manual', value: 1, quote: 'USDe', label: 'PT 到期后可按 1:1 赎回 USDe，需区分到期日' },
+    redemptionPath: ['进入 Pendle', '选择 USDe PT 市场', '到期后 Redeem PT', '获得 USDe'],
+    wait: '必须等到期；折价对应时间收益',
+    entryUrl: 'https://app.pendle.finance/',
+  },
+];
+
+const LEGACY_REDEMPTION_ASSETS = [
+  {
+    symbol: 'sUSDe',
+    name: 'Ethena Staked USDe',
+    kind: 'Ethena 可赎回收益凭证',
+    source: 'DeFiLlama / Ethena',
+    market: { type: 'llama', chainId: 1, address: '0x9D39A5DE30e57443BfF2A8307A4256c8797A3497' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x9D39A5DE30e57443BfF2A8307A4256c8797A3497',
+      decimals: 18,
+      quote: 'USDe',
+      label: 'sUSDe 可通过 Ethena unstake/cooldown 赎回成 USDe；这里按 ERC-4626 convertToAssets(1 sUSDe) 读取可赎回 USDe 数量',
+    },
+    redemptionPath: ['进入 Ethena App', 'sUSDe unstake / cooldown', '冷却结束后领取 USDe', 'USDe 再换 USDC/USDT'],
+    wait: '通常有冷却期，具体以 Ethena 页面为准',
+    entryUrl: 'https://app.ethena.fi/',
+  },
+  {
+    symbol: 'USDe',
+    name: 'Ethena USDe',
+    kind: '稳定币赎回/退出',
+    source: 'Binance ticker / Ethena',
+    market: { type: 'binance', pair: 'USDEUSDT', quote: 'USDT' },
+    reference: { type: 'manual', value: 1, quote: 'USDT/USD', label: 'USDe 赎回/退出按接近 1 美元参考，执行前需确认 Ethena 申赎资格、额度和 CEX 出口' },
+    redemptionPath: ['在 Binance/DEX 查看 USDe 市场价', '如有 Ethena 申赎权限，按官方流程 redeem/退出', '或直接换成 USDT/USDC', '核对到账和滑点'],
+    wait: 'USDe 本身不是带收益凭证；重点看二级市场价格和官方申赎/退出权限',
+    entryUrl: 'https://app.ethena.fi/',
+  },
+  {
+    symbol: 'sDAI',
+    name: 'Savings DAI',
+    kind: '收益型稳定币',
+    source: 'LI.FI token price / Spark',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'sDAI' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x83F20F44975D03b1b09e64809B757c47f942BEeA',
+      decimals: 18,
+      quote: 'DAI',
+      label: '按 ERC-4626 convertToAssets(1 sDAI) 估算赎回 DAI',
+    },
+    redemptionPath: ['进入 Spark / Sky', 'withdraw 或 redeem sDAI', '获得 DAI', 'DAI 再换 USDC/USDT'],
+    wait: '通常可即时退出，但仍需看合约状态和前端额度',
+    entryUrl: 'https://app.spark.fi/',
+  },
+  {
+    symbol: 'sUSDS',
+    name: 'Sky Savings USDS',
+    kind: '收益型稳定币',
+    source: 'LI.FI token price / Sky + 链上汇率',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'sUSDS' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD',
+      decimals: 18,
+      quote: 'USDS',
+      label: '按 Sky sUSDS ERC-4626 convertToAssets(1 sUSDS) 估算赎回 USDS',
+    },
+    redemptionPath: ['进入 Sky App', 'sUSDS withdraw / unwrap', '获得 USDS', 'USDS 再换 USDC/USDT'],
+    wait: '通常即时或按协议状态处理',
+    entryUrl: 'https://app.sky.money/',
+  },
+  {
+    symbol: 'syrupUSDC',
+    name: 'Maple Syrup USDC',
+    kind: 'RWA/借贷收益凭证',
+    source: 'LI.FI token price / Maple + 链上汇率',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'syrupUSDC' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x80ac24aA929eaF5013f6436cdA2a7ba190f5Cc0b',
+      decimals: 6,
+      quote: 'USDC',
+      label: '按 ERC-4626 convertToAssets(1 syrupUSDC) 估算赎回 USDC',
+    },
+    redemptionPath: ['进入 Maple Syrup', '提交 withdraw / redeem', '等待赎回窗口或队列处理', '领取 USDC'],
+    wait: '可能存在赎回队列、流动性窗口和协议限制',
+    entryUrl: 'https://syrup.fi/',
+  },
+  {
+    symbol: 'USDY',
+    name: 'Ondo US Dollar Yield',
+    kind: 'RWA 国债收益币',
+    source: 'LI.FI token price / Ondo',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'USDY' },
+    reference: { type: 'unknown-rate', quote: 'USD', label: 'USDY 赎回价按 Ondo 官方 NAV/资格规则确认' },
+    redemptionPath: ['进入 Ondo 入口', '确认账户资格、KYC 和可赎回地区', '提交 USDY redeem', '按官方流程结算'],
+    wait: '受 KYC、地区限制和赎回窗口影响',
+    entryUrl: 'https://ondo.finance/',
+  },
+  {
+    symbol: 'OUSG',
+    name: 'Ondo Short-Term US Treasuries',
+    kind: 'RWA 国债基金',
+    source: 'Ondo / 需接官方 NAV',
+    market: { type: 'manual', price: 0, quote: 'USD' },
+    reference: { type: 'unknown-rate', quote: 'USD', label: 'OUSG 需要接 Ondo 官方 NAV/申赎接口' },
+    redemptionPath: ['进入 Ondo 机构入口', '确认白名单和份额', '按官方 NAV 提交 redemption', '等待结算'],
+    wait: '通常需要白名单、KYC 和工作日结算',
+    entryUrl: 'https://ondo.finance/',
+  },
+  {
+    symbol: 'USYC',
+    name: 'Hashnote US Yield Coin',
+    kind: 'RWA 国债收益币',
+    source: 'LI.FI token price / Hashnote price report',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'USYC' },
+    reference: { type: 'unknown-rate', quote: 'USD', label: 'USYC 赎回价需以 Hashnote/Circle 官方入口为准' },
+    redemptionPath: ['进入 Hashnote/Circle 相关入口', '确认白名单和账户权限', '提交 USYC redemption', '等待结算'],
+    wait: '受白名单、KYC 和工作日结算影响',
+    entryUrl: 'https://www.hashnote.com/',
+  },
+  {
+    symbol: 'wUSDM',
+    name: 'Wrapped Mountain Protocol USD',
+    kind: 'RWA 收益稳定币',
+    source: 'LI.FI token price / Mountain + 链上汇率',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'wUSDM' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x57F5E098CaD7A3D1Eed53991D4d66C45C9AF7812',
+      decimals: 18,
+      quote: 'USDM',
+      label: '按 ERC-4626 convertToAssets(1 wUSDM) 估算 unwrap 后 USDM',
+    },
+    redemptionPath: ['unwrap wUSDM -> USDM', '进入 Mountain Protocol', '确认 KYC/地区权限', '按官方流程 redeem USDM'],
+    wait: '可能受地区、KYC 和结算时间限制',
+    entryUrl: 'https://mountainprotocol.com/',
+  },
+  {
+    symbol: 'BETH',
+    name: 'Binance Beacon ETH',
+    kind: '中心化质押凭证',
+    source: 'Binance ticker',
+    market: { type: 'binance', pair: 'BETHETH', quote: 'ETH' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'Binance BETH -> ETH 赎回参考 1:1' },
+    redemptionPath: ['进入 Binance Earn / ETH Staking', '选择 Redeem BETH', '等待 Binance 与以太坊提款队列处理', '到账 ETH 后现货卖出'],
+    wait: '可能有每日额度和排队时间，以 Binance 页面为准',
+    entryUrl: 'https://www.binance.com/en/earn/eth-staking',
+  },
+  {
+    symbol: 'WBETH',
+    name: 'Wrapped Binance ETH',
+    kind: '中心化质押凭证',
+    source: 'Binance ticker / SAPI rateHistory',
+    market: { type: 'binance', pair: 'WBETHETH', quote: 'ETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'WBETH 兑换率随奖励累计变化，需以 Binance 页面为准' },
+    redemptionPath: ['进入 Binance ETH Staking / WBETH', '按页面兑换率 redeem 或 unwrap', '获得 ETH', '急用可直接卖 WBETH/ETH'],
+    wait: '兑换率随奖励累计变化，赎回时间以 Binance 页面为准',
+    entryUrl: 'https://www.binance.com/en/earn/eth-staking',
+  },
+  {
+    symbol: 'BNSOL',
+    name: 'Binance Staked SOL',
+    kind: '中心化质押凭证',
+    source: 'Binance ticker / SAPI rateHistory',
+    market: { type: 'binance', pair: 'BNSOLSOL', quote: 'SOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'BNSOL/SOL 赎回兑换率需以 Binance 页面为准' },
+    redemptionPath: ['进入 Binance SOL Staking', '选择 Redeem BNSOL', '按当前 conversion rate 赎回 SOL', '等待处理完成'],
+    wait: '兑换率周期性更新，赎回处理可能需要数日',
+    entryUrl: 'https://www.binance.com/en/sol-staking',
+  },
+  {
+    symbol: 'stETH',
+    name: 'Lido Staked ETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Lido',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'stETH' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'Lido stETH -> ETH 提款参考接近 1:1' },
+    redemptionPath: ['进入 Lido', 'Request withdrawals', '等待以太坊退出队列', '领取 ETH'],
+    wait: '通常需要等待退出队列，具体以 Lido 页面为准',
+    entryUrl: 'https://stake.lido.fi/withdrawals',
+  },
+  {
+    symbol: 'wstETH',
+    name: 'Wrapped stETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Lido',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'wstETH' },
+    reference: {
+      type: 'contract',
+      chainId: 1,
+      address: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0',
+      selector: '0x035faf82',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 wstETH stEthPerToken() 链上汇率估算 unwrap 后 stETH/ETH',
+    },
+    redemptionPath: ['unwrap wstETH -> stETH', '进入 Lido withdrawals', '等待退出队列', '领取 ETH'],
+    wait: 'wstETH/stETH 汇率随奖励累计变化',
+    entryUrl: 'https://stake.lido.fi/withdrawals',
+  },
+  {
+    symbol: 'rETH',
+    name: 'Rocket Pool ETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Rocket Pool',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'rETH' },
+    reference: {
+      type: 'contract',
+      chainId: 1,
+      address: '0xae78736Cd615f374D3085123A210448E74Fc6393',
+      selector: '0xe6aa216c',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Rocket Pool rETH getExchangeRate() 链上汇率估算赎回 ETH',
+    },
+    redemptionPath: ['进入 Rocket Pool', 'swap/redeem rETH', '协议池有流动性则即时换 ETH', '否则走二级市场'],
+    wait: '受 Rocket Pool 存款池流动性影响',
+    entryUrl: 'https://stake.rocketpool.net/',
+  },
+  {
+    symbol: 'cbETH',
+    name: 'Coinbase Wrapped Staked ETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'cbETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'cbETH 赎回汇率需以 Coinbase 为准' },
+    redemptionPath: ['进入 Coinbase', 'unwrap/redeem cbETH', '获得 ETH', '或在链上/交易所卖出 cbETH'],
+    wait: '受 Coinbase 赎回规则影响',
+    entryUrl: 'https://www.coinbase.com/',
+  },
+  {
+    symbol: 'frxETH',
+    name: 'Frax Ether',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Frax',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'frxETH' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'frxETH 目标兑换参考接近 1 ETH' },
+    redemptionPath: ['进入 Frax', 'frxETH/sfrxETH 相关兑换或退出', '换回 ETH 或 Curve 池退出'],
+    wait: '需看 Frax/Curve 流动性与协议出口',
+    entryUrl: 'https://app.frax.finance/',
+  },
+  {
+    symbol: 'sfrxETH',
+    name: 'Staked Frax Ether',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Frax',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'sfrxETH' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xac3E018457B222d93114458476f3E3416Abbe38F',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 ERC-4626 convertToAssets(1 sfrxETH) 估算 frxETH/ETH 退出参考',
+    },
+    redemptionPath: ['sfrxETH withdraw -> frxETH', 'frxETH 通过 Frax/Curve 退出 ETH'],
+    wait: '兑换率随收益累计变化',
+    entryUrl: 'https://app.frax.finance/',
+  },
+  {
+    symbol: 'weETH',
+    name: 'Wrapped eETH',
+    kind: 'ETH LRT/LST',
+    source: 'LI.FI token price / ether.fi',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'weETH' },
+    reference: {
+      type: 'contract',
+      chainId: 1,
+      address: '0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee',
+      selector: '0x679aefce',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 weETH getRate() 链上汇率估算 unwrap/退出 ETH',
+    },
+    redemptionPath: ['unwrap weETH -> eETH', '进入 ether.fi unstake', '等待退出', '领取 ETH'],
+    wait: '退出时间受协议和以太坊队列影响',
+    entryUrl: 'https://app.ether.fi/',
+  },
+  {
+    symbol: 'eETH',
+    name: 'ether.fi ETH',
+    kind: 'ETH LRT/LST',
+    source: 'LI.FI token price / ether.fi',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'eETH' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'eETH 目标兑换参考接近 1 ETH' },
+    redemptionPath: ['进入 ether.fi', 'unstake eETH', '等待退出', '领取 ETH'],
+    wait: '退出时间受协议和以太坊队列影响',
+    entryUrl: 'https://app.ether.fi/',
+  },
+  {
+    symbol: 'ezETH',
+    name: 'Renzo Restaked ETH',
+    kind: 'ETH LRT',
+    source: 'LI.FI token price / Renzo',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'ezETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'ezETH 赎回率需以 Renzo 为准' },
+    redemptionPath: ['进入 Renzo', 'withdraw/unstake ezETH', '等待退出', '领取 ETH 或等价资产'],
+    wait: '受 Renzo 退出窗口影响',
+    entryUrl: 'https://app.renzoprotocol.com/',
+  },
+  {
+    symbol: 'rsETH',
+    name: 'Kelp rsETH',
+    kind: 'ETH LRT',
+    source: 'LI.FI token price / Kelp',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'rsETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'rsETH 赎回率需以 Kelp 为准' },
+    redemptionPath: ['进入 Kelp DAO', 'withdraw rsETH', '等待退出', '领取底层资产'],
+    wait: '受 Kelp 退出机制影响',
+    entryUrl: 'https://kelpdao.xyz/',
+  },
+  {
+    symbol: 'mETH',
+    name: 'Mantle Staked Ether',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / Mantle',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'mETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'mETH 赎回率需以 Mantle 为准' },
+    redemptionPath: ['进入 Mantle mETH', 'unstake/redeem mETH', '等待退出', '领取 ETH'],
+    wait: '以 Mantle 页面为准',
+    entryUrl: 'https://meth.mantle.xyz/',
+  },
+  {
+    symbol: 'osETH',
+    name: 'StakeWise osETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / StakeWise',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'osETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'osETH 退出需看 StakeWise vault' },
+    redemptionPath: ['进入 StakeWise', '选择对应 vault', 'burn/exit osETH', '领取 ETH'],
+    wait: '受对应 vault 和退出队列影响',
+    entryUrl: 'https://app.stakewise.io/',
+  },
+  {
+    symbol: 'pufETH',
+    name: 'Puffer Restaked ETH',
+    kind: 'ETH LRT',
+    source: 'LI.FI token price / Puffer + 链上汇率',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'pufETH' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xD9A442856C234a39a81a089C06451EBAa4306a72',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 ERC-4626 convertToAssets(1 pufETH) 估算退出 ETH',
+    },
+    redemptionPath: ['进入 Puffer', '选择 withdraw/unstake pufETH', '等待退出窗口', '领取 ETH 或底层资产'],
+    wait: '受 Puffer 退出机制和以太坊队列影响',
+    entryUrl: 'https://app.puffer.fi/',
+  },
+  {
+    symbol: 'swETH',
+    name: 'Swell Staked ETH',
+    kind: 'ETH LST/LRT',
+    source: 'LI.FI token price / Swell + 链上汇率',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'swETH' },
+    reference: {
+      type: 'contract',
+      chainId: 1,
+      address: '0xf951E335afb289353dc249e82926178EaC7DEd78',
+      selector: '0x679aefce',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 swETH getRate() 链上汇率估算退出 ETH',
+    },
+    redemptionPath: ['进入 Swell', '选择 unstake/withdraw swETH', '等待退出', '领取 ETH'],
+    wait: '受协议和以太坊退出队列影响',
+    entryUrl: 'https://app.swellnetwork.io/',
+  },
+  {
+    symbol: 'ankrETH',
+    name: 'Ankr Staked ETH',
+    kind: 'ETH LST',
+    source: 'LI.FI token price / CoinGecko',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'ankrETH' },
+    reference: { type: 'unknown-rate', quote: 'ETH', label: 'ankrETH 赎回率需以 Ankr 为准' },
+    redemptionPath: ['进入 Ankr Staking', 'unstake ankrETH', '等待退出', '领取 ETH'],
+    wait: '受 Ankr unstake 规则和退出队列影响',
+    entryUrl: 'https://www.ankr.com/staking/',
+  },
+  {
+    symbol: 'mSOL',
+    name: 'Marinade Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Jupiter route',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'mSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'mSOL/SOL 赎回率需以 Marinade 为准' },
+    redemptionPath: ['进入 Marinade', 'unstake mSOL', '选择 delayed unstake 或 liquidity unstake', '领取 SOL'],
+    wait: '延迟赎回通常需等待 epoch；即时退出取决于流动性',
+    entryUrl: 'https://marinade.finance/app/',
+  },
+  {
+    symbol: 'JitoSOL',
+    name: 'Jito Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Jupiter route',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'JitoSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'JitoSOL/SOL 赎回率需以 Jito 为准' },
+    redemptionPath: ['进入 Jito', 'unstake JitoSOL', '等待 epoch 或走流动性退出', '领取 SOL'],
+    wait: '通常受 Solana epoch 和流动性影响',
+    entryUrl: 'https://www.jito.network/',
+  },
+  {
+    symbol: 'JupSOL',
+    name: 'Jupiter Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Jupiter route',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'JupSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'JupSOL/SOL 赎回率需以 Jupiter 为准' },
+    redemptionPath: ['进入 Jupiter LST', 'unstake JupSOL', '等待或通过流动性退出', '领取 SOL'],
+    wait: '以 Jupiter 页面为准',
+    entryUrl: 'https://jup.ag/',
+  },
+  {
+    symbol: 'bSOL',
+    name: 'BlazeStake Staked SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Jupiter route',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'bSOL' },
+    reference: { type: 'unknown-rate', quote: 'SOL', label: 'bSOL/SOL 赎回率需以 BlazeStake 为准' },
+    redemptionPath: ['进入 BlazeStake', 'unstake bSOL', '等待 epoch 或流动性退出', '领取 SOL'],
+    wait: '通常受 Solana epoch 影响',
+    entryUrl: 'https://stake.solblaze.org/',
+  },
+  {
+    symbol: 'infSOL',
+    name: 'Sanctum Infinity SOL',
+    kind: 'SOL LST',
+    source: 'LI.FI token price / Sanctum',
+    market: { type: 'lifi-token', chainId: 1151111081099710, symbol: 'infSOL' },
+    reference: { type: 'same-as-market', quote: 'SOL', label: 'infSOL 当前公开路由流动性极低，先按市场参考展示，不打 A0/A1 复核标签；执行前需到 Sanctum 核对可退出路由' },
+    redemptionPath: ['进入 Sanctum', '选择 unstake / swap infSOL', '确认退出路由和滑点', '领取 SOL 或其他 LST'],
+    wait: '取决于 Sanctum 路由、流动性和 Solana epoch',
+    entryUrl: 'https://app.sanctum.so/',
+  },
+  {
+    symbol: 'LBTC',
+    name: 'Lombard Staked BTC',
+    kind: 'BTC LST',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'LBTC' },
+    reference: { type: 'unknown-rate', quote: 'BTC', label: 'LBTC 赎回 BTC 的资格、周期和费用需以 Lombard 为准' },
+    redemptionPath: ['进入 Lombard', '确认可赎回额度和白名单', '提交 LBTC withdraw/redeem', '等待跨链或托管结算'],
+    wait: '可能涉及白名单、跨链和托管结算时间',
+    entryUrl: 'https://www.lombard.finance/',
+  },
+  {
+    symbol: 'SolvBTC',
+    name: 'Solv BTC',
+    kind: 'BTC 收益凭证',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 1, symbol: 'SolvBTC' },
+    reference: { type: 'unknown-rate', quote: 'BTC', label: 'SolvBTC 赎回路径和汇率需以 Solv 为准' },
+    redemptionPath: ['进入 Solv App', '选择 SolvBTC redemption/withdraw', '确认目标链和费用', '领取 BTC 或封装 BTC'],
+    wait: '取决于 Solv 产品、目标链和额度',
+    entryUrl: 'https://app.solv.finance/',
+  },
+  {
+    symbol: 'SolvBTC.BBN',
+    name: 'SolvBTC Babylon',
+    kind: 'BTC LST/LRT',
+    source: 'LI.FI token price / Chainlink',
+    market: { type: 'lifi-token', chainId: 42161, symbol: 'SolvBTC.BBN' },
+    reference: { type: 'unknown-rate', quote: 'BTC', label: 'SolvBTC.BBN 退出取决于 Babylon/Solv 规则' },
+    redemptionPath: ['进入 Solv App', '选择 Babylon 相关产品', '提交 unstake/redeem', '等待解锁后领取底层 BTC 资产'],
+    wait: '可能有锁定期、积分/收益结算和跨链等待',
+    entryUrl: 'https://app.solv.finance/',
+  },
+  {
+    symbol: 'pumpBTC',
+    name: 'pumpBTC',
+    kind: 'BTC LST',
+    source: 'LI.FI token price / pumpBTC',
+    market: { type: 'lifi-token', chainId: 56, symbol: 'pumpBTC' },
+    reference: { type: 'unknown-rate', quote: 'BTC', label: 'pumpBTC 赎回 BTC 的规则和窗口需以官方为准' },
+    redemptionPath: ['进入 pumpBTC', '确认 withdraw/redeem 是否开放', '提交退出', '等待托管或跨链处理'],
+    wait: '受官方赎回开放状态、托管和跨链影响',
+    entryUrl: 'https://pumpbtc.xyz/',
+  },
+  {
+    symbol: 'PT-sUSDe',
+    name: 'Pendle PT sUSDe',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle / 需按具体到期日',
+    market: { type: 'manual', price: 0, quote: 'USDe/sUSDe' },
+    reference: { type: 'manual', value: 1, quote: 'USDe/sUSDe', label: 'PT 到期后可按 1:1 赎回底层资产，必须区分到期日' },
+    redemptionPath: ['进入 Pendle', '选择对应 PT 市场和到期日', '到期后 Redeem PT', '获得底层资产'],
+    wait: '必须等到期；不同到期日价差不同',
+    entryUrl: 'https://app.pendle.finance/',
+  },
+  {
+    symbol: 'PT-USDe',
+    name: 'Pendle PT USDe',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle / 需按具体到期日',
+    market: { type: 'manual', price: 0, quote: 'USDe' },
+    reference: { type: 'manual', value: 1, quote: 'USDe', label: 'PT 到期后可按 1:1 赎回 USDe，必须区分到期日' },
+    redemptionPath: ['进入 Pendle', '选择 USDe PT 市场', '到期后 Redeem PT', '获得 USDe'],
+    wait: '必须等到期；折价对应时间收益',
+    entryUrl: 'https://app.pendle.finance/',
+  },
+  {
+    symbol: 'PT-sUSDS',
+    name: 'Pendle PT sUSDS',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle / 需按具体到期日',
+    market: { type: 'manual', price: 0, quote: 'USDS/sUSDS' },
+    reference: { type: 'manual', value: 1, quote: 'USDS/sUSDS', label: 'PT 到期后赎回底层资产，需按市场和到期日确认' },
+    redemptionPath: ['进入 Pendle', '选择 sUSDS PT 市场', '核对到期日和底层资产', '到期后 Redeem PT'],
+    wait: '不到期无法按面值退出，二级市场卖出会反映期限折价',
+    entryUrl: 'https://app.pendle.finance/',
+  },
+  {
+    symbol: 'YT/PT RWA',
+    name: 'Pendle RWA / Yield PT',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle / 需选择具体市场',
+    market: { type: 'manual', price: 0, quote: '底层资产' },
+    reference: { type: 'unknown-rate', quote: '底层资产', label: 'Pendle 不同 RWA/收益市场需逐个接市场价格和到期日' },
+    redemptionPath: ['进入 Pendle Markets', '筛选 Stable / RWA / LST 市场', '选择 PT 和到期日', '到期后 Redeem PT 或提前卖出'],
+    wait: '核心变量是到期日、底层资产、流动性和提前卖出滑点',
+    entryUrl: 'https://app.pendle.finance/trade/markets',
+  },
+];
+
+const ACTIVE_REDEMPTION_ASSETS = [
+  {
+    symbol: 'sUSDe',
+    name: 'Ethena Staked USDe',
+    kind: '收益型稳定币',
+    source: 'DeFiLlama / Ethena + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0x9D39A5DE30e57443BfF2A8307A4256c8797A3497' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x9D39A5DE30e57443BfF2A8307A4256c8797A3497',
+      decimals: 18,
+      quote: 'USDe',
+      label: '按 Ethena sUSDe ERC-4626 convertToAssets(1 sUSDe) 读取可赎回 USDe 数量',
+    },
+    redemptionPath: ['进入 Ethena App', 'sUSDe unstake / cooldown', '冷却结束后领取 USDe', 'USDe 再换 USDC/USDT'],
+    wait: '通常有冷却期，具体以 Ethena 页面为准',
+    entryUrl: 'https://app.ethena.fi/',
+  },
+  {
+    symbol: 'sDAI',
+    name: 'Savings DAI',
+    kind: '收益型稳定币',
+    source: 'DeFiLlama / Spark + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0x83F20F44975D03b1b09e64809B757c47f942BEeA' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x83F20F44975D03b1b09e64809B757c47f942BEeA',
+      decimals: 18,
+      quote: 'DAI',
+      label: '按 Spark/Maker sDAI ERC-4626 convertToAssets(1 sDAI) 估算可赎回 DAI 数量',
+    },
+    redemptionPath: ['进入 Spark / Sky', 'withdraw 或 redeem sDAI', '获得 DAI', 'DAI 再换 USDC/USDT'],
+    wait: '通常可即时退出，但仍需看合约状态和前端额度',
+    entryUrl: 'https://app.spark.fi/',
+  },
+  {
+    symbol: 'sUSDS',
+    name: 'Sky Savings USDS',
+    kind: '收益型稳定币',
+    source: 'DeFiLlama / Sky + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xa3931d71877C0E7a3148CB7Eb4463524FEc27fbD',
+      decimals: 18,
+      quote: 'USDS',
+      label: '按 Sky sUSDS ERC-4626 convertToAssets(1 sUSDS) 估算可赎回 USDS 数量',
+    },
+    redemptionPath: ['进入 Sky App', 'sUSDS withdraw / unwrap', '获得 USDS', 'USDS 再换 USDC/USDT'],
+    wait: '通常即时或按协议状态处理',
+    entryUrl: 'https://app.sky.money/',
+  },
+  {
+    symbol: 'sfrxUSD',
+    name: 'Staked Frax USD',
+    kind: '收益型稳定币',
+    source: 'DeFiLlama / Frax + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0xcf62F905562626CfcDD2261162a51fd02Fc9c5b6' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xcf62F905562626CfcDD2261162a51fd02Fc9c5b6',
+      decimals: 18,
+      quote: 'frxUSD',
+      label: '按 Frax sfrxUSD ERC-4626 convertToAssets(1 sfrxUSD) 估算可赎回 frxUSD 数量',
+    },
+    redemptionPath: ['进入 Frax', 'withdraw / redeem sfrxUSD', '获得 frxUSD', 'frxUSD 再换 USDC/USDT'],
+    wait: '通常按 ERC-4626 即时换回 frxUSD，仍需看前端和池子状态',
+    entryUrl: 'https://app.frax.finance/',
+  },
+  {
+    symbol: 'PT-sUSDe',
+    name: 'Pendle PT sUSDe',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle 官方市场',
+    market: { type: 'manual', price: 0, quote: 'sUSDe' },
+    reference: {
+      type: 'manual',
+      value: 1,
+      quote: 'sUSDe',
+      label: 'Pendle PT 到期按 1:1 赎回底层 sUSDe；这里用官方市场到期日和隐含年化反推 PT 价格',
+    },
+    redemptionPath: ['进入 Pendle', '选择 PT-sUSDe 市场和到期日', '持有到期后 Redeem PT', '获得 sUSDe'],
+    wait: '必须持有到期；提前卖出要另看二级市场深度和滑点',
+    entryUrl: 'https://app.pendle.finance/trade/markets',
+  },
+  {
+    symbol: 'PT-USDe',
+    name: 'Pendle PT USDe',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle 官方市场',
+    market: { type: 'manual', price: 0, quote: 'USDe' },
+    reference: {
+      type: 'manual',
+      value: 1,
+      quote: 'USDe',
+      label: 'Pendle PT 到期按 1:1 赎回 USDe；这里用官方市场到期日和隐含年化反推 PT 价格',
+    },
+    redemptionPath: ['进入 Pendle', '选择 PT-USDe 市场和到期日', '持有到期后 Redeem PT', '获得 USDe'],
+    wait: '必须持有到期；提前卖出要另看二级市场深度和滑点',
+    entryUrl: 'https://app.pendle.finance/trade/markets',
+  },
+  {
+    symbol: 'PT-sUSDS',
+    name: 'Pendle PT sUSDS',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle 官方市场',
+    market: { type: 'manual', price: 0, quote: 'sUSDS' },
+    reference: {
+      type: 'manual',
+      value: 1,
+      quote: 'sUSDS',
+      label: 'Pendle PT 到期按 1:1 赎回底层 sUSDS/stUSDS；这里用官方市场到期日和隐含年化反推 PT 价格',
+    },
+    redemptionPath: ['进入 Pendle', '选择 PT-sUSDS / PT-stUSDS 市场', '核对到期日和底层资产', '到期后 Redeem PT'],
+    wait: '必须持有到期；底层命名以 Pendle 具体市场为准',
+    entryUrl: 'https://app.pendle.finance/trade/markets',
+  },
+  {
+    symbol: 'PT-sfrxUSD',
+    name: 'Pendle PT sfrxUSD',
+    kind: 'Pendle 到期赎回',
+    source: 'Pendle 官方市场',
+    market: { type: 'manual', price: 0, quote: 'sfrxUSD' },
+    reference: {
+      type: 'manual',
+      value: 1,
+      quote: 'sfrxUSD',
+      label: 'Pendle PT 到期按 1:1 赎回底层 sfrxUSD；只有 Pendle 返回活跃市场时才展示年化',
+    },
+    redemptionPath: ['进入 Pendle', '选择 PT-sfrxUSD 市场和到期日', '持有到期后 Redeem PT', '获得 sfrxUSD'],
+    wait: '必须持有到期；若没有活跃市场则不强行估算',
+    entryUrl: 'https://app.pendle.finance/trade/markets',
+  },
+  {
+    symbol: 'syrupUSDC',
+    name: 'Maple Syrup USDC',
+    kind: 'RWA/借贷收益凭证',
+    source: 'DeFiLlama / Maple + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0x80ac24aA929eaF5013f6436cdA2a7ba190f5Cc0b' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x80ac24aA929eaF5013f6436cdA2a7ba190f5Cc0b',
+      decimals: 6,
+      quote: 'USDC',
+      label: '按 Maple syrupUSDC ERC-4626 convertToAssets(1 syrupUSDC) 估算可赎回 USDC 数量',
+    },
+    redemptionPath: ['进入 Maple Syrup', '提交 withdraw / redeem', '等待赎回窗口或队列处理', '领取 USDC'],
+    wait: 'Maple 可能有赎回处理、流动性窗口或队列；年化按约 14 天估算，会偏乐观',
+    entryUrl: 'https://syrup.fi/',
+  },
+  {
+    symbol: 'syrupUSDT',
+    name: 'Maple Syrup USDT',
+    kind: 'RWA/借贷收益凭证',
+    source: 'DeFiLlama / Maple + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0x356b8d89c1e1239cbbb9de4815c39a1474d5ba7d' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0x356b8d89c1e1239cbbb9de4815c39a1474d5ba7d',
+      decimals: 6,
+      quote: 'USDT',
+      label: '按 Maple syrupUSDT ERC-4626 convertToAssets(1 syrupUSDT) 估算可赎回 USDT 数量',
+    },
+    redemptionPath: ['进入 Maple Syrup', '提交 withdraw / redeem', '等待赎回窗口或队列处理', '领取 USDT'],
+    wait: 'Maple 可能有赎回处理、流动性窗口或队列；年化按约 14 天估算，会偏乐观',
+    entryUrl: 'https://syrup.fi/',
+  },
+  {
+    symbol: 'stETH',
+    name: 'Lido Staked ETH',
+    kind: 'ETH LST',
+    source: 'DeFiLlama / Lido',
+    market: { type: 'llama', chainId: 1, address: '0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84' },
+    reference: { type: 'manual', value: 1, quote: 'ETH', label: 'Lido stETH 可按提款队列退出为 ETH；参考赎回单位按 1 stETH -> 1 ETH 估算' },
+    redemptionPath: ['进入 Lido', 'Request withdrawals', '等待以太坊退出队列', '领取 ETH'],
+    wait: '等待时间随 Lido/以太坊退出队列变化；这里按约 5 天估算',
+    entryUrl: 'https://stake.lido.fi/withdrawals',
+  },
+  {
+    symbol: 'wstETH',
+    name: 'Wrapped stETH',
+    kind: 'ETH LST',
+    source: 'DeFiLlama / Lido + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0' },
+    reference: {
+      type: 'contract',
+      chainId: 1,
+      address: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0',
+      selector: '0x035faf82',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 wstETH stEthPerToken() 链上汇率估算 unwrap 后 stETH，再按 Lido 提款队列退出 ETH',
+    },
+    redemptionPath: ['unwrap wstETH -> stETH', '进入 Lido withdrawals', '等待退出队列', '领取 ETH'],
+    wait: '等待时间随 Lido/以太坊退出队列变化；这里按约 5 天估算',
+    entryUrl: 'https://stake.lido.fi/withdrawals',
+  },
+  {
+    symbol: 'rETH',
+    name: 'Rocket Pool ETH',
+    kind: 'ETH LST',
+    source: 'DeFiLlama / Rocket Pool + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0xae78736Cd615f374D3085123A210448E74Fc6393' },
+    reference: {
+      type: 'contract',
+      chainId: 1,
+      address: '0xae78736Cd615f374D3085123A210448E74Fc6393',
+      selector: '0xe6aa216c',
+      decimals: 18,
+      quote: 'ETH',
+      label: '按 Rocket Pool rETH getExchangeRate() 链上汇率估算可换回 ETH 数量',
+    },
+    redemptionPath: ['进入 Rocket Pool', 'swap/redeem rETH', '协议池有流动性则即时换 ETH', '否则走二级市场'],
+    wait: '能否直接按协议退出取决于 Rocket Pool 存款池流动性；这里按约 1 天估算',
+    entryUrl: 'https://stake.rocketpool.net/',
+  },
+  {
+    symbol: 'sfrxETH',
+    name: 'Staked Frax Ether',
+    kind: 'ETH LST',
+    source: 'DeFiLlama / Frax + 链上汇率',
+    market: { type: 'llama', chainId: 1, address: '0xac3E018457B222d93114458476f3E3416Abbe38F' },
+    reference: {
+      type: 'erc4626',
+      chainId: 1,
+      address: '0xac3E018457B222d93114458476f3E3416Abbe38F',
+      decimals: 18,
+      quote: 'frxETH',
+      label: '按 Frax sfrxETH ERC-4626 convertToAssets(1 sfrxETH) 估算可换回 frxETH 数量；这是 ETH 资产，不是稳定币',
+    },
+    redemptionPath: ['sfrxETH withdraw -> frxETH', 'frxETH 通过 Frax/Curve 退出 ETH 或二级市场卖出'],
+    wait: 'frxETH 到 ETH 出口依赖 Frax/Curve 流动性；这里按约 1 天估算',
+    entryUrl: 'https://app.frax.finance/',
+  },
+];
+
+const LIFI_CHAIN_LABELS = new Map([
+  [1, 'Ethereum'],
+  [8453, 'Base'],
+  [42161, 'Arbitrum'],
+  [10, 'OP Mainnet'],
+  [137, 'Polygon'],
+  [43114, 'Avalanche'],
+  [56, 'BSC'],
+  [59144, 'Linea'],
+  [130, 'Unichain'],
+  [480, 'World Chain'],
+]);
+
+const TTL = {
+  stablecoins: 60_000,
+  chains: 10 * 60_000,
+  tokens: 10 * 60_000,
+  routes: 20_000,
+};
+
+const cache = new Map();
+let binanceTimeOffsetMs = 0;
+const sentA0Notifications = new Map();
+const notificationState = {
+  checkedAt: null,
+  lastSentAt: null,
+  lastError: null,
+  lastA0Count: 0,
+  lastA0: [],
+};
+
+// 缓存策略：TTL 内直接命中；TTL 过期后尝试重新拉取，
+// 但**保留上一次成功的值**（stale cache）——
+// 上游（llama.fi / coingecko / binance）在当前网络经常不可达，
+// 如果让异常直接冒出去，整个接口会变成 502、前端整页空白。
+// 有旧值时宁可返回稍旧的数据并标记 stale，也不要让看板打不开。
+const STALE_CACHE = new Map();
+
+function cached(key, ttl, loader) {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.time < ttl) {
+    return hit.value;
+  }
+  const value = loader().then((data) => {
+    cache.set(key, { time: Date.now(), value: Promise.resolve(data) });
+    STALE_CACHE.set(key, { time: Date.now(), value: Promise.resolve(data) });
+    return data;
+  }).catch((error) => {
+    // 刷新失败：如果以前成功过，就退回旧数据，避免整页 502
+    const last = STALE_CACHE.get(key);
+    if (last) {
+      cache.set(key, { time: Date.now(), value: last.value });
+      return last.value;
+    }
+    throw error;
+  });
+  cache.set(key, { time: Date.now(), value });
+  return value;
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      accept: 'application/json',
+      ...(options.headers || {}),
+      'user-agent': 'stablecoin-risk-desk/0.1',
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 180)}`);
+  }
+
+  return response.json();
+}
+
+function numberFromPath(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function formatChainRows(asset) {
+  return Object.entries(asset.chainCirculating || {})
+    .map(([chain, item]) => {
+      const current = numberFromPath(item?.current?.peggedUSD);
+      const prevDay = numberFromPath(item?.circulatingPrevDay?.peggedUSD);
+      const prevWeek = numberFromPath(item?.circulatingPrevWeek?.peggedUSD);
+      const share =
+        asset.circulating?.peggedUSD > 0
+          ? (current / asset.circulating.peggedUSD) * 100
+          : 0;
+      return {
+        chain,
+        current,
+        share,
+        dayChange: current - prevDay,
+        weekChange: current - prevWeek,
+      };
+    })
+    .filter((row) => row.current > 0)
+    .sort((a, b) => b.current - a.current)
+    .slice(0, 8);
+}
+
+function riskLevel(asset) {
+  const price = numberFromPath(asset.price, 1);
+  const hasPrice = price > 0.01;
+  const deviationBps = hasPrice ? Math.abs(price - 1) * 10_000 : 0;
+  const supply = numberFromPath(asset.circulating?.peggedUSD);
+  const prevDay = numberFromPath(asset.circulatingPrevDay?.peggedUSD);
+  const dayChangePct = prevDay > 0 ? ((supply - prevDay) / prevDay) * 100 : 0;
+  const isNavStyle = NAV_STYLE_STABLE_SYMBOLS.has(String(asset.symbol).toUpperCase());
+
+  if (!isNavStyle && deviationBps >= 75) return 'high';
+  if (Math.abs(dayChangePct) >= 10) return 'high';
+  if (!isNavStyle && deviationBps >= 25) return 'watch';
+  if (Math.abs(dayChangePct) >= 4) return 'watch';
+  return 'normal';
+}
+
+function normalizeStableAsset(asset) {
+  const supply = numberFromPath(asset.circulating?.peggedUSD);
+  const prevDay = numberFromPath(asset.circulatingPrevDay?.peggedUSD);
+  const prevWeek = numberFromPath(asset.circulatingPrevWeek?.peggedUSD);
+  const price = numberFromPath(asset.price, 1);
+  const isNavStyle = NAV_STYLE_STABLE_SYMBOLS.has(String(asset.symbol).toUpperCase());
+  const hasPrice = price > 0.01;
+  const rawDeviationBps = hasPrice ? (price - 1) * 10_000 : 0;
+  const pegDeviationBps = isNavStyle ? 0 : rawDeviationBps;
+
+  return {
+    id: asset.id,
+    name: asset.name,
+    symbol: asset.symbol,
+    pegMechanism: asset.pegMechanism,
+    price,
+    hasPrice,
+    priceType: isNavStyle ? 'nav' : 'peg',
+    priceNote: isNavStyle ? 'NAV/收益型价格，不按 1 美元脱锚判断' : 'USD 锚定价格',
+    isNavStyle,
+    rawDeviationBps,
+    deviationBps: pegDeviationBps,
+    absoluteDeviationBps: Math.abs(pegDeviationBps),
+    supply,
+    dayChange: supply - prevDay,
+    weekChange: supply - prevWeek,
+    dayChangePct: prevDay > 0 ? ((supply - prevDay) / prevDay) * 100 : 0,
+    weekChangePct: prevWeek > 0 ? ((supply - prevWeek) / prevWeek) * 100 : 0,
+    risk: riskLevel(asset),
+    chains: formatChainRows(asset),
+  };
+}
+
+async function getStablecoins() {
+  const raw = await cached('stablecoins', TTL.stablecoins, () =>
+    fetchJson(LLAMA_STABLECOINS_URL),
+  );
+  const all = raw.peggedAssets
+    .filter((asset) => asset.pegType === 'peggedUSD')
+    .filter((asset) => !HIDDEN_STABLE_SYMBOLS.has(String(asset.symbol).toUpperCase()))
+    .map(normalizeStableAsset)
+    .sort((a, b) => b.supply - a.supply);
+
+  const bySymbol = new Map();
+  for (const asset of all) {
+    const symbol = String(asset.symbol).toUpperCase();
+    if (asset.supply < MIN_DISPLAY_SUPPLY || !asset.hasPrice) continue;
+
+    const previous = bySymbol.get(symbol);
+    if (
+      !previous ||
+      (asset.hasPrice && !previous.hasPrice) ||
+      asset.supply > previous.supply
+    ) {
+      bySymbol.set(symbol, asset);
+    }
+  }
+
+  const watchlist = [...bySymbol.values()]
+    .sort((a, b) => b.supply - a.supply)
+    .slice(0, 80);
+
+  const materialAssets = all.filter((asset) => asset.supply >= MIN_DISPLAY_SUPPLY && asset.hasPrice);
+  const pegMaterialAssets = materialAssets.filter((asset) => !asset.isNavStyle);
+  const largestDeviation = [...pegMaterialAssets].sort(
+    (a, b) => b.absoluteDeviationBps - a.absoluteDeviationBps,
+  )[0];
+
+  const totalSupply = all.reduce((sum, asset) => sum + asset.supply, 0);
+  const highRisk = materialAssets.filter((asset) => asset.risk === 'high').length;
+  const watchRisk = materialAssets.filter((asset) => asset.risk === 'watch').length;
+  const topMovers = all
+    .filter((asset) => asset.supply > 10_000_000)
+    .sort((a, b) => Math.abs(b.dayChangePct) - Math.abs(a.dayChangePct))
+    .slice(0, 12);
+
+  return {
+    updatedAt: new Date().toISOString(),
+    source: 'DeFiLlama Stablecoins',
+    summary: {
+      totalSupply,
+      count: all.length,
+      highRisk,
+      watchRisk,
+      minDisplaySupply: MIN_DISPLAY_SUPPLY,
+      largestDeviation,
+    },
+    watchlist,
+    topBySupply: all.slice(0, 30),
+    topMovers,
+  };
+}
+
+async function getLifiChains() {
+  const data = await cached('lifi-chains', TTL.chains, () =>
+    fetchJson(`${LIFI_BASE}/chains`),
+  );
+  return data.chains;
+}
+
+async function getLifiTokens() {
+  const chainParam = CORE_CHAIN_IDS.join(',');
+  const data = await cached(`lifi-tokens-${chainParam}`, TTL.tokens, () =>
+    fetchJson(`${LIFI_BASE}/tokens?chains=${chainParam}`),
+  );
+
+  return data.tokens;
+}
+
+async function getRedemptionLifiTokens() {
+  const chainParam = REDEMPTION_CHAIN_IDS.join(',');
+  const data = await cached(`lifi-redemption-tokens-${chainParam}`, TTL.tokens, () =>
+    fetchJson(`${LIFI_BASE}/tokens?chains=${chainParam}`),
+  );
+
+  return data.tokens;
+}
+
+function tokenKey(token) {
+  return `${token.chainId}:${String(token.symbol).toUpperCase()}:${token.address}`;
+}
+
+function tokenSymbolsMatch(tokenSymbol, desiredSymbol) {
+  return String(tokenSymbol).toUpperCase() === String(desiredSymbol).toUpperCase();
+}
+
+function findCanonicalToken(candidates, chainId, symbol) {
+  const canonicalAddress = CANONICAL_TOKEN_ADDRESSES.get(
+    `${chainId}:${String(symbol).toUpperCase()}`,
+  );
+  if (!canonicalAddress) return null;
+
+  return candidates.find(
+    (item) => String(item.address).toLowerCase() === canonicalAddress.toLowerCase(),
+  ) || null;
+}
+
+function chooseToken(tokens, chainId, symbol) {
+  const desired = String(symbol).toUpperCase();
+  const candidates = (tokens[String(chainId)] || [])
+    .filter((token) => tokenSymbolsMatch(token.symbol, desired))
+    .filter((token) => ROUTE_TOKENS.includes(String(token.symbol).toUpperCase()));
+
+  if (!candidates.length) return null;
+
+  return (
+    findCanonicalToken(candidates, chainId, desired) ||
+    candidates.find((token) => String(token.coinKey).toUpperCase() === desired) ||
+    candidates.find((token) => token.address && token.decimals <= 6) ||
+    candidates[0]
+  );
+}
+
+function chooseLifiToken(tokens, chainId, symbol) {
+  const desired = String(symbol).toUpperCase();
+  const candidates = (tokens[String(chainId)] || []).filter((token) =>
+    tokenSymbolsMatch(token.symbol, desired),
+  );
+
+  if (!candidates.length) return null;
+
+  return (
+    findCanonicalToken(candidates, chainId, desired) ||
+    candidates.find((token) => String(token.coinKey).toUpperCase() === desired) ||
+    candidates.find((token) => numberFromPath(token.priceUSD) > 0) ||
+    candidates[0]
+  );
+}
+
+function tokenUsdPrice(tokens, chainId, symbol) {
+  const token = chooseLifiToken(tokens, chainId, symbol);
+  return numberFromPath(token?.priceUSD);
+}
+
+function referenceUnitUsdPrice(tokens, quote) {
+  const normalized = String(quote || '').toUpperCase();
+  if (['USD', 'USDC', 'USDT', 'DAI', 'USDE', 'USDS', 'USDM', 'FRXUSD', 'FRAX'].includes(normalized)) {
+    return 1;
+  }
+  if (
+    normalized.includes('USDC') ||
+    normalized.includes('USDE') ||
+    normalized.includes('USDS') ||
+    normalized.includes('FRXUSD')
+  ) {
+    return 1;
+  }
+  if (normalized === 'ETH') return tokenUsdPrice(tokens, 1, 'ETH');
+  if (normalized === 'FRXETH') return tokenUsdPrice(tokens, 1, 'frxETH');
+  if (normalized === 'SOL') return tokenUsdPrice(tokens, 1151111081099710, 'SOL');
+  if (normalized === 'BTC') {
+    return tokenUsdPrice(tokens, 1, 'WBTC') || tokenUsdPrice(tokens, 56, 'BTCB');
+  }
+  return 0;
+}
+
+function normalizeMarketPrice(marketPrice, marketQuote, referenceQuote, tokens) {
+  if (!marketPrice) return 0;
+  const normalizedMarketQuote = String(marketQuote || '').toUpperCase();
+  if (normalizedMarketQuote && normalizedMarketQuote !== 'USD') {
+    return marketPrice;
+  }
+
+  const denominator = referenceUnitUsdPrice(tokens, referenceQuote);
+  if (!denominator || denominator <= 0) return marketPrice;
+  return marketPrice / denominator;
+}
+
+function redemptionWaitDays(asset) {
+  return asset.waitDays || REDEMPTION_WAIT_DAYS.get(asset.symbol) || 7;
+}
+
+function annualizedFromSpread(spreadPct, waitDays) {
+  if (spreadPct === null || !Number.isFinite(spreadPct) || waitDays <= 0) return null;
+  return (spreadPct / waitDays) * 365;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function opportunityLevel(score, executable, hardA0 = false) {
+  if (hardA0 && executable && score >= 90) return 'A0';
+  if (executable && score >= 70) return 'A1';
+  if (score >= 45) return 'A2';
+  return '观察';
+}
+
+function scoreRedemptionOpportunity({
+  asset,
+  spreadPct,
+  annualizedPct,
+  quality,
+  isExecutable,
+  missingExecutionMarket,
+  conservativeReason,
+  executionCaution,
+}) {
+  if (spreadPct === null || spreadPct <= 0) {
+    return {
+      opportunityScore: 0,
+      opportunityLevel: '观察',
+      opportunityReason: spreadPct === null ? '缺少可比较价格' : '当前不是折价赎回方向',
+    };
+  }
+
+  const spreadScore = clamp(spreadPct * 120, 0, 35);
+  const annualizedScore = annualizedPct === null ? 0 : clamp(annualizedPct, 0, 30);
+  const sourceScore =
+    quality === 'Binance 官方签名接口'
+      ? 25
+      : quality === '链上汇率'
+        ? 20
+        : quality === '官方公开接口'
+          ? 12
+          : 6;
+  const executionScore = isExecutable ? 10 : 0;
+  const penalty =
+    missingExecutionMarket ? 35 :
+      conservativeReason ? 30 :
+        executionCaution ? 25 :
+          annualizedPct === null ? 20 : 0;
+  const opportunityScore = Math.round(clamp(
+    spreadScore + annualizedScore + sourceScore + executionScore - penalty,
+    0,
+    100,
+  ));
+  const hardA0 =
+    isExecutable &&
+    !REDEMPTION_A0_BLOCKLIST.has(asset.symbol) &&
+    spreadPct >= 0.35 &&
+    annualizedPct !== null &&
+    annualizedPct >= 25 &&
+    ['Binance 官方签名接口', '链上汇率'].includes(quality);
+
+  return {
+    opportunityScore,
+    opportunityLevel: opportunityLevel(opportunityScore, isExecutable, hardA0),
+    opportunityReason: conservativeReason
+      ? `观察：${conservativeReason}`
+      : missingExecutionMarket
+        ? '观察：缺少订单簿买入成本'
+        : executionCaution
+          ? `观察：${executionCaution}`
+          : `折价 ${spreadPct.toFixed(3)}%，估算年化 ${annualizedPct === null ? '不计' : `${annualizedPct.toFixed(2)}%`}`,
+  };
+}
+
+function scoreChainSpreadOpportunity(item) {
+  const spreadScore = clamp(item.spreadBps / 2, 0, 35);
+  const routeScore = item.routeSupported ? 18 : 5;
+  const cautionPenalty = item.routeSupported ? 12 : 25;
+  const score = Math.round(clamp(spreadScore + routeScore - cautionPenalty, 0, 100));
+  return {
+    opportunityScore: score,
+    opportunityLevel: opportunityLevel(score, false),
+    opportunityReason: item.routeSupported
+      ? '理论跨链价差：尚未扣桥费、滑点和目标链出口深度'
+      : '观察：当前未接入可执行跨链路径',
+  };
+}
+
+function scoreExchangeTicker(row) {
+  const deviation = Math.abs(row.deviationBps);
+  const volumeScore = row.volumeQuote >= 10_000_000 ? 25 : row.volumeQuote >= 1_000_000 ? 18 : 8;
+  const score = Math.round(clamp(deviation * 0.9 + volumeScore, 0, 100));
+  const executable = row.usable && row.volumeQuote >= MIN_EXCHANGE_QUOTE_VOLUME;
+  return {
+    opportunityScore: score,
+    opportunityLevel: opportunityLevel(score, executable, executable && deviation >= 60),
+    opportunityReason: `CEX 偏离 ${row.deviationBps.toFixed(1)} bps，24小时成交额约 ${Math.round(row.volumeQuote).toLocaleString('en-US')} ${row.quote}`,
+  };
+}
+
+function scoreExchangeSpreadOpportunity(item) {
+  const minVolume = Math.min(item.low.volumeQuote || 0, item.high.volumeQuote || 0);
+  const volumeScore = minVolume >= 10_000_000 ? 25 : minVolume >= 1_000_000 ? 18 : 8;
+  const score = Math.round(clamp(item.spreadBps * 1.4 + volumeScore, 0, 100));
+  const executable = item.low.usable && item.high.usable && minVolume >= MIN_EXCHANGE_QUOTE_VOLUME;
+  return {
+    opportunityScore: score,
+    opportunityLevel: opportunityLevel(score, executable, executable && item.spreadBps >= 45),
+    opportunityReason: `交易所间价差 ${item.spreadBps.toFixed(1)} bps，仍需核对订单簿和划转限制`,
+  };
+}
+
+function a0NotificationConfig() {
+  const channels = String(process.env.A0_NOTIFY_CHANNELS || '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  const twilioReady = Boolean(
+    process.env.TWILIO_ACCOUNT_SID &&
+    process.env.TWILIO_AUTH_TOKEN &&
+    process.env.TWILIO_FROM &&
+    process.env.ALERT_TO,
+  );
+  const webhookReady = Boolean(process.env.A0_WEBHOOK_URL);
+
+  return {
+    enabled: process.env.A0_NOTIFY_ENABLED === '1',
+    channels,
+    cooldownMinutes: Math.round(A0_NOTIFICATION_COOLDOWN_MS / 60_000),
+    smsReady: twilioReady && channels.includes('sms'),
+    callReady: twilioReady && channels.includes('call'),
+    webhookReady: webhookReady && channels.includes('webhook'),
+    configured:
+      process.env.A0_NOTIFY_ENABLED === '1' &&
+      (
+        (twilioReady && (channels.includes('sms') || channels.includes('call'))) ||
+        (webhookReady && channels.includes('webhook'))
+      ),
+  };
+}
+
+function a0Message(opportunities) {
+  const top = opportunities[0];
+  if (!top) return '稳定币看板暂无 A0 复核项';
+  return `稳定币看板发现 ${opportunities.length} 个 A0 复核项。最高：${top.title}，分数 ${top.score}。${top.detail}`;
+}
+
+function twilioAuthHeader() {
+  const raw = `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`;
+  return `Basic ${Buffer.from(raw).toString('base64')}`;
+}
+
+async function sendTwilioSms(message) {
+  const body = new URLSearchParams({
+    From: process.env.TWILIO_FROM,
+    To: process.env.ALERT_TO,
+    Body: message,
+  });
+  await fetchJson(
+    `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: twilioAuthHeader(),
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body,
+    },
+  );
+}
+
+async function sendTwilioCall(message) {
+  const twiml = `<Response><Say language="zh-CN">${message}</Say></Response>`;
+  const body = new URLSearchParams({
+    From: process.env.TWILIO_FROM,
+    To: process.env.ALERT_TO,
+    Twiml: twiml,
+  });
+  await fetchJson(
+    `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls.json`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: twilioAuthHeader(),
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body,
+    },
+  );
+}
+
+async function sendA0Webhook(opportunities, message) {
+  await fetchJson(process.env.A0_WEBHOOK_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(process.env.A0_WEBHOOK_TOKEN
+        ? { authorization: `Bearer ${process.env.A0_WEBHOOK_TOKEN}` }
+        : {}),
+    },
+    body: JSON.stringify({
+      type: 'stablecoin-a0-alert',
+      message,
+      opportunities,
+      sentAt: new Date().toISOString(),
+    }),
+  });
+}
+
+function collectA0Opportunities({ redemptions, exchanges }) {
+  const redemptionItems = (redemptions.assets || []).map((asset) => ({
+    id: `redemption-${asset.symbol}`,
+    source: '赎回价差',
+    level: asset.opportunityLevel,
+    score: asset.opportunityScore || 0,
+    title: `${asset.symbol} 赎回价差`,
+    detail: `${asset.opportunityReason || asset.opportunity}；折价 ${asset.spreadPct === null ? '--' : `${asset.spreadPct.toFixed(3)}%`}`,
+  }));
+  const exchangeSpreadItems = (exchanges.opportunities || []).map((item) => ({
+    id: `exchange-spread-${item.symbol}`,
+    source: 'CEX价差',
+    level: item.opportunityLevel,
+    score: item.opportunityScore || 0,
+    title: `${item.symbol} CEX 价差`,
+    detail: `${item.spreadBps.toFixed(1)} bps；${item.opportunityReason || item.direction}`,
+  }));
+  const exchangeDepegItems = (exchanges.stableRows || []).map((item) => ({
+    id: `exchange-depeg-${item.exchange}-${item.pair}`,
+    source: 'CEX脱锚',
+    level: item.opportunityLevel,
+    score: item.opportunityScore || 0,
+    title: `${item.symbol} ${item.exchange} 脱锚`,
+    detail: `${item.deviationBps.toFixed(1)} bps；${item.opportunityReason || item.pair}`,
+  }));
+
+  return [
+    ...redemptionItems,
+    ...exchangeSpreadItems,
+    ...exchangeDepegItems,
+  ]
+    .filter((item) => item.level === 'A0')
+    .sort((a, b) => b.score - a.score);
+}
+
+async function sendA0Notifications(opportunities) {
+  const config = a0NotificationConfig();
+  if (!config.enabled || !config.configured || !opportunities.length) return [];
+
+  const signature = opportunities.map((item) => item.id).sort().join('|');
+  const lastSent = sentA0Notifications.get(signature) || 0;
+  if (Date.now() - lastSent < A0_NOTIFICATION_COOLDOWN_MS) return [];
+
+  const message = a0Message(opportunities);
+  const sent = [];
+  if (config.webhookReady) {
+    await sendA0Webhook(opportunities, message);
+    sent.push('webhook');
+  }
+  if (config.smsReady) {
+    await sendTwilioSms(message);
+    sent.push('sms');
+  }
+  if (config.callReady) {
+    await sendTwilioCall(message);
+    sent.push('call');
+  }
+
+  sentA0Notifications.set(signature, Date.now());
+  notificationState.lastSentAt = new Date().toISOString();
+  return sent;
+}
+
+async function scanA0Notifications() {
+  notificationState.checkedAt = new Date().toISOString();
+  const [redemptions, exchanges] = await Promise.all([
+    getRedemptionSpreads(),
+    getExchangePrices(),
+  ]);
+  const opportunities = collectA0Opportunities({ redemptions, exchanges });
+  notificationState.lastA0Count = opportunities.length;
+  notificationState.lastA0 = opportunities.slice(0, 10);
+
+  try {
+    await sendA0Notifications(opportunities);
+    notificationState.lastError = null;
+  } catch (error) {
+    notificationState.lastError = error.message;
+  }
+}
+
+function referenceConfig(asset) {
+  return (
+    CONTRACT_REFERENCE_OVERRIDES.get(asset.symbol) ||
+    ERC4626_REFERENCE_OVERRIDES.get(asset.symbol) ||
+    asset.reference
+  );
+}
+
+function externalReferenceFor(asset, references) {
+  return references.get(asset.symbol) || null;
+}
+
+function fallbackRedemptionReference(asset) {
+  return (
+    STATIC_REDEMPTION_REFERENCE_OVERRIDES.get(asset.symbol) ||
+    MANUAL_REDEMPTION_RATES.get(asset.symbol) ||
+    null
+  );
+}
+
+function applyRedemptionOverrides(asset, referencePrice, references = new Map()) {
+  const externalRate = externalReferenceFor(asset, references);
+  if (externalRate?.value > 0) return externalRate.value;
+
+  const fallbackRate = fallbackRedemptionReference(asset);
+  if (fallbackRate) return fallbackRate.value;
+
+  if (referencePrice > 0) return referencePrice;
+
+  return 0;
+}
+
+function applyMarketOverrides(asset, marketPrice) {
+  if (marketPrice > 0) return marketPrice;
+
+  const overrides = {
+  };
+
+  return overrides[asset.symbol] || 0;
+}
+
+async function getPendleMarkets() {
+  return cached('pendle-active-markets', 60_000, () => fetchJson(PENDLE_MARKETS_URL));
+}
+
+function daysUntil(dateString) {
+  const end = new Date(dateString).getTime();
+  if (!Number.isFinite(end)) return null;
+  return Math.max(1, Math.ceil((end - Date.now()) / 86_400_000));
+}
+
+function pendleMarketForSymbol(markets, symbol) {
+  const targets = {
+    'PT-sUSDe': ['sUSDe'],
+    'PT-USDe': ['USDe'],
+    'PT-sUSDS': ['sUSDS', 'stUSDS'],
+    'PT-sfrxUSD': ['sfrxUSD', 'frxUSD'],
+  }[symbol];
+  if (!targets) return null;
+
+  return (markets.markets || [])
+    .filter((market) => targets.some((target) => market.name === target))
+    .filter((market) => daysUntil(market.expiry) > 0)
+    .sort((a, b) => numberFromPath(b.details?.liquidity) - numberFromPath(a.details?.liquidity))[0] || null;
+}
+
+function applyPendleData(asset, marketPrice, referencePrice, waitDays, pendleMarkets) {
+  const market = pendleMarketForSymbol(pendleMarkets, asset.symbol);
+  if (!market) return { marketPrice: 0, referencePrice: 0, waitDays, pendleMarket: null };
+
+  const days = daysUntil(market.expiry) || waitDays;
+  const impliedApy = numberFromPath(market.details?.impliedApy);
+  const ptPrice =
+    impliedApy > 0
+      ? 1 / (1 + impliedApy * (days / 365))
+      : marketPrice;
+
+  return {
+    marketPrice: ptPrice || marketPrice,
+    referencePrice: referencePrice || 1,
+    waitDays: days,
+    pendleMarket: {
+      name: market.name,
+      expiry: market.expiry,
+      impliedApy: impliedApy * 100,
+      liquidity: numberFromPath(market.details?.liquidity),
+      address: market.address,
+    },
+  };
+}
+
+function marketQuality(asset, originalMarketPrice, marketPrice) {
+  if (originalMarketPrice > 0) return asset.market.type === 'manual' ? '人工录入' : '实时市场';
+  if (marketPrice > 0) return '人工参考';
+  return '待接';
+}
+
+function referenceQuality(asset, referencePrice, wasMissing) {
+  const fallbackRate = fallbackRedemptionReference(asset);
+  if (fallbackRate) return fallbackRate.quality;
+
+  const reference = referenceConfig(asset);
+  if (reference.type === 'erc4626' || reference.type === 'contract') return '链上汇率';
+  if (reference.type === 'manual' && !wasMissing) return '人工参考';
+  if (reference.type === 'same-as-market') return '市场参考';
+  if (reference.type === 'binance-market') return '交易所参考';
+  if (referencePrice > 0) return wasMissing ? '市场隐含' : '人工参考';
+  return '待接';
+}
+
+function opportunityTag(spreadPct, annualizedPct, quality) {
+  if (quality === '市场隐含' || spreadPct === null || annualizedPct === null) return null;
+  if (spreadPct <= 0 || annualizedPct <= 0) return null;
+  if (annualizedPct >= 25 && spreadPct >= 0.2) return '重点复核';
+  if (annualizedPct >= 8 && spreadPct >= 0.05) return '可关注';
+  return null;
+}
+
+function conservativePolicyFor(asset, quality) {
+  const reason = CONSERVATIVE_PRICING_POLICIES.get(asset.symbol);
+  if (reason) return reason;
+  if (CORE_REDEMPTION_SYMBOLS.has(asset.symbol)) return null;
+  if (quality === 'Jupiter 路由报价') return '路由报价只代表小额 swap 出口，不等于协议赎回价';
+  if (quality === '公开价格参考') return '公开价格参考不等于可执行赎回价';
+  if (quality === '人工参考') return '人工参考价不等于实时可执行赎回价';
+  return null;
+}
+
+function executionCautionFor(asset, marketType, executionMarket) {
+  if (CORE_REDEMPTION_SYMBOLS.has(asset.symbol)) return null;
+  if (executionMarket) return null;
+  if (marketType === 'binance') {
+    return asset.symbol === 'USDe'
+      ? null
+      : '缺少订单簿买入成本';
+  }
+  if (asset.kind.includes('RWA')) return 'RWA/NAV 赎回涉及账户资格、窗口和结算，不能按即时可执行复核处理';
+  if (asset.kind.includes('Pendle')) return 'Pendle 到期赎回必须核对具体市场、到期日和二级市场深度';
+  if (asset.kind.includes('BTC')) return 'BTC 凭证退出涉及托管、跨链或解锁流程，暂按观察口径';
+  if (asset.kind.includes('LRT')) return 'LRT 退出队列、额度和底层资产未实时接入，暂按观察口径';
+  if (asset.kind.includes('LST')) return 'LST 市场价来自聚合价格，不含买入深度、退出队列和滑点';
+  if (marketType === 'lifi-token' || marketType === 'llama') {
+    return '聚合市场价不含订单簿深度和实际成交滑点';
+  }
+  return null;
+}
+
+function executableOpportunityTag(asset, spreadPct, annualizedPct, quality, usedReferenceFallback) {
+  if (usedReferenceFallback || conservativePolicyFor(asset, quality)) return null;
+  return opportunityTag(spreadPct, annualizedPct, quality);
+}
+
+function opportunityText(asset, spreadPct, isExecutable) {
+  if (spreadPct === null) return '待接官方汇率';
+  if (!isExecutable) return '观察价差';
+  if (asset.symbol === 'sUSDe' && spreadPct > 0) return '折价买入赎回 USDe';
+  if (asset.symbol === 'sDAI' && spreadPct > 0) return '折价买入赎回 DAI';
+  if (asset.symbol === 'sUSDS' && spreadPct > 0) return '折价买入赎回 USDS';
+  if (asset.symbol === 'sfrxUSD' && spreadPct > 0) return '折价买入赎回 frxUSD';
+  if (String(asset.symbol).startsWith('PT-') && spreadPct > 0) return '折价买入持有到期赎回';
+  if (spreadPct > 0) return '折价买入赎回';
+  if (spreadPct < 0) return '溢价交易';
+  return '接近赎回价';
+}
+
+function shouldShowInRedemptionFocus(asset) {
+  return CORE_REDEMPTION_SYMBOLS.has(asset.symbol) ||
+    asset.annualizedPct !== null ||
+    asset.opportunityLevel === 'A0' ||
+    asset.opportunityLevel === 'A1';
+}
+
+function isPendleAsset(asset) {
+  return String(asset.symbol).startsWith('PT-') || asset.symbol === 'YT/PT RWA';
+}
+
+function getTokenChainPrices(tokens, symbol) {
+  const desired = String(symbol).toUpperCase();
+
+  return CORE_CHAIN_IDS.map((chainId) => {
+    const candidates = (tokens[String(chainId)] || [])
+      .filter((token) => tokenSymbolsMatch(token.symbol, desired))
+      .filter((token) => {
+        const price = numberFromPath(token.priceUSD);
+        const [minPrice, maxPrice] = CHAIN_SPREAD_PRICE_BAND;
+        return price >= minPrice && price <= maxPrice;
+      });
+
+    const token =
+      findCanonicalToken(candidates, chainId, desired) ||
+      candidates.find((item) => String(item.coinKey).toUpperCase() === desired) ||
+        candidates.find((item) => item.decimals <= 6) ||
+        candidates[0];
+
+    if (!token) return null;
+
+    return {
+      chainId,
+      chain: LIFI_CHAIN_LABELS.get(chainId) || chainId,
+      symbol: token.symbol,
+      address: token.address,
+      price: numberFromPath(token.priceUSD),
+    };
+  }).filter(Boolean);
+}
+
+function parseExchangeTicker(config, payload) {
+  if (config.type === 'binance') {
+    return {
+      exchange: config.exchange,
+      symbol: config.symbol,
+      pair: config.pair,
+      quote: config.quote,
+      price: numberFromPath(payload.lastPrice || payload.price),
+      bid: numberFromPath(payload.bidPrice),
+      ask: numberFromPath(payload.askPrice),
+      volumeQuote: numberFromPath(payload.quoteVolume),
+      changePct24h: numberFromPath(payload.priceChangePercent),
+    };
+  }
+
+  if (config.type === 'okx') {
+    const row = payload.data?.[0];
+    return {
+      exchange: config.exchange,
+      symbol: config.symbol,
+      pair: config.pair,
+      quote: config.quote,
+      price: numberFromPath(row?.last),
+      bid: numberFromPath(row?.bidPx),
+      ask: numberFromPath(row?.askPx),
+      volumeQuote: numberFromPath(row?.volCcy24h),
+      changePct24h: 0,
+    };
+  }
+
+  if (config.type === 'gate') {
+    const row = Array.isArray(payload) ? payload[0] : null;
+    return {
+      exchange: config.exchange,
+      symbol: config.symbol,
+      pair: config.pair,
+      quote: config.quote,
+      price: numberFromPath(row?.last),
+      bid: numberFromPath(row?.highest_bid),
+      ask: numberFromPath(row?.lowest_ask),
+      volumeQuote: numberFromPath(row?.quote_volume),
+      changePct24h: numberFromPath(row?.change_percentage),
+    };
+  }
+
+  if (config.type === 'coinbase') {
+    return {
+      exchange: config.exchange,
+      symbol: config.symbol,
+      pair: config.pair,
+      quote: config.quote,
+      price: numberFromPath(payload.price),
+      bid: numberFromPath(payload.bid),
+      ask: numberFromPath(payload.ask),
+      volumeQuote: numberFromPath(payload.volume),
+      changePct24h: 0,
+    };
+  }
+
+  return null;
+}
+
+async function fetchExchangeTicker(config) {
+  let url = '';
+  if (config.type === 'binance') {
+    url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${config.pair}`;
+  }
+  if (config.type === 'okx') {
+    url = `https://www.okx.com/api/v5/market/ticker?instId=${config.pair}`;
+  }
+  if (config.type === 'gate') {
+    url = `https://api.gateio.ws/api/v4/spot/tickers?currency_pair=${config.pair}`;
+  }
+  if (config.type === 'coinbase') {
+    url = `https://api.exchange.coinbase.com/products/${config.pair}/ticker`;
+  }
+
+  try {
+    const payload = await cached(`exchange-${config.type}-${config.pair}`, 15_000, () =>
+      fetchJson(url),
+    );
+    const row = parseExchangeTicker(config, payload);
+    if (!row || row.price <= 0) return null;
+    return row;
+  } catch {
+    return null;
+  }
+}
+
+function exchangePriceUsable(row) {
+  if (!row) return false;
+  if (['ETH', 'SOL', 'BTC'].includes(row.quote)) return true;
+  return row.price >= 0.97 &&
+    row.price <= 1.03 &&
+    row.volumeQuote >= MIN_EXCHANGE_QUOTE_VOLUME;
+}
+
+function stableQuoteUsdPrices(rows) {
+  const prices = new Map([['USD', 1]]);
+  const usdtUsdRows = rows
+    .filter((row) => row.symbol === 'USDT' && row.quote === 'USD' && row.price > 0)
+    .map((row) => row.price)
+    .sort((a, b) => a - b);
+
+  if (usdtUsdRows.length) {
+    prices.set('USDT', usdtUsdRows[Math.floor(usdtUsdRows.length / 2)]);
+  } else {
+    prices.set('USDT', 1);
+  }
+
+  return prices;
+}
+
+function exchangeUsdPrice(row, quoteUsdPrices) {
+  if (!row) return 0;
+  if (['ETH', 'SOL', 'BTC'].includes(row.quote)) return row.price;
+  return row.price * (quoteUsdPrices.get(row.quote) || 1);
+}
+
+function exchangeSideUsdPrice(row, side, quoteUsdPrices) {
+  if (!row) return 0;
+  const rawPrice = side === 'buy' ? row.ask : row.bid;
+  const price = rawPrice > 0 ? rawPrice : row.price;
+  if (['ETH', 'SOL', 'BTC'].includes(row.quote)) return price;
+  return price * (quoteUsdPrices.get(row.quote) || 1);
+}
+
+function exchangeDeviationBps(row, quoteUsdPrices = new Map([['USD', 1], ['USDT', 1]])) {
+  const price = exchangeUsdPrice(row, quoteUsdPrices);
+  return (price - 1) * 10_000;
+}
+
+async function getExchangePrices() {
+  const rows = (
+    await Promise.all(
+      [...EXCHANGE_STABLE_MARKETS, ...EXCHANGE_REDEMPTION_MARKETS].map(fetchExchangeTicker),
+    )
+  ).filter(Boolean);
+
+  const quoteUsdPrices = stableQuoteUsdPrices(rows);
+
+  const stableRows = rows
+    .filter((row) => EXCHANGE_STABLE_MARKETS.some((item) => item.pair === row.pair && item.exchange === row.exchange))
+    .map((row) => {
+      const enriched = {
+        ...row,
+        usdPrice: exchangeUsdPrice(row, quoteUsdPrices),
+        buyUsdPrice: exchangeSideUsdPrice(row, 'buy', quoteUsdPrices),
+        sellUsdPrice: exchangeSideUsdPrice(row, 'sell', quoteUsdPrices),
+        usable: exchangePriceUsable(row),
+        deviationBps: exchangeDeviationBps(row, quoteUsdPrices),
+        alert: exchangePriceUsable(row) && Math.abs(exchangeDeviationBps(row, quoteUsdPrices)) >= 10,
+      };
+      return {
+        ...enriched,
+        ...scoreExchangeTicker(enriched),
+      };
+    });
+
+  const redemptionRows = rows
+    .filter((row) => EXCHANGE_REDEMPTION_MARKETS.some((item) => item.pair === row.pair && item.exchange === row.exchange))
+    .map((row) => ({
+      ...row,
+      usable: true,
+      deviationBps: exchangeDeviationBps(row),
+      alert: Math.abs(exchangeDeviationBps(row)) >= 10,
+    }));
+
+  const bySymbol = new Map();
+  for (const row of stableRows.filter((item) => item.usable)) {
+    const list = bySymbol.get(row.symbol) || [];
+    list.push(row);
+    bySymbol.set(row.symbol, list);
+  }
+
+  const opportunities = [...bySymbol.entries()]
+    .map(([symbol, list]) => {
+      if (list.length < 2) return null;
+      const low = list.reduce((best, item) => (item.buyUsdPrice < best.buyUsdPrice ? item : best), list[0]);
+      const high = list.reduce((best, item) => (item.sellUsdPrice > best.sellUsdPrice ? item : best), list[0]);
+      const spreadBps = (high.sellUsdPrice - low.buyUsdPrice) * 10_000;
+      return {
+        symbol,
+        low,
+        high,
+        spreadBps,
+        alert: spreadBps >= 5,
+        direction: `${low.exchange} 按卖一买入，${high.exchange} 按买一卖出`,
+      };
+    })
+    .filter(Boolean)
+    .map((item) => ({
+      ...item,
+      ...scoreExchangeSpreadOpportunity(item),
+    }))
+    .sort((a, b) => b.spreadBps - a.spreadBps);
+
+  return {
+    updatedAt: new Date().toISOString(),
+    source: 'Binance + OKX + Gate + Coinbase public tickers',
+    stableRows: stableRows.sort((a, b) => Math.abs(b.deviationBps) - Math.abs(a.deviationBps)),
+    redemptionRows,
+    opportunities,
+  };
+}
+
+async function getStablecoinChainSpreads() {
+  const tokens = await getLifiTokens();
+  const opportunities = CHAIN_SPREAD_SYMBOLS.map((symbol) => {
+    const usable = getTokenChainPrices(tokens, symbol);
+
+    if (usable.length < 2) return null;
+
+    const low = usable.reduce((best, item) => (item.price < best.price ? item : best), usable[0]);
+    const high = usable.reduce((best, item) => (item.price > best.price ? item : best), usable[0]);
+    const mid = (low.price + high.price) / 2;
+    const spreadBps = mid > 0 ? ((high.price - low.price) / mid) * 10_000 : 0;
+
+    const item = {
+      symbol,
+      low,
+      high,
+      spreadBps,
+      alert: spreadBps >= CHAIN_SPREAD_ALERT_BPS,
+      direction: `买入 ${low.chain}，跨到 ${high.chain} 卖出`,
+      routeSupported:
+        ROUTE_TOKENS.includes(symbol) &&
+        CORE_CHAIN_IDS.includes(low.chainId) &&
+        CORE_CHAIN_IDS.includes(high.chainId),
+      chainPrices: usable.sort((a, b) => a.price - b.price).slice(0, 8),
+    };
+    return {
+      ...item,
+      ...scoreChainSpreadOpportunity(item),
+    };
+  })
+    .filter((item) => item && item.spreadBps >= 1)
+    .sort((a, b) => b.spreadBps - a.spreadBps);
+
+  return {
+    updatedAt: new Date().toISOString(),
+    source: 'LI.FI token price',
+    thresholdBps: CHAIN_SPREAD_ALERT_BPS,
+    opportunities,
+  };
+}
+
+function parseAmount(amount, decimals) {
+  const value = Number(amount);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error('Amount must be greater than 0');
+  }
+  return BigInt(Math.floor(value * 10 ** Math.min(decimals, 8))).toString() +
+    '0'.repeat(Math.max(decimals - Math.min(decimals, 8), 0));
+}
+
+function summarizeStep(step) {
+  return {
+    id: step.id,
+    type: step.type,
+    tool: step.tool,
+    toolName: step.toolDetails?.name || step.tool,
+    fromChainId: step.action?.fromChainId,
+    toChainId: step.action?.toChainId,
+    fromChain: LIFI_CHAIN_LABELS.get(step.action?.fromChainId) || step.action?.fromChainId,
+    toChain: LIFI_CHAIN_LABELS.get(step.action?.toChainId) || step.action?.toChainId,
+    fromToken: step.action?.fromToken?.symbol,
+    toToken: step.action?.toToken?.symbol,
+    fromAmount: step.estimate?.fromAmount,
+    toAmount: step.estimate?.toAmount,
+    executionDuration: step.estimate?.executionDuration || 0,
+    gasUsd: (step.estimate?.gasCosts || []).reduce(
+      (sum, item) => sum + numberFromPath(item.amountUSD),
+      0,
+    ),
+    feeUsd: (step.estimate?.feeCosts || []).reduce(
+      (sum, item) => sum + numberFromPath(item.amountUSD),
+      0,
+    ),
+  };
+}
+
+function summarizeRoute(route) {
+  const steps = (route.includedSteps || []).map(summarizeStep);
+  const bridgeTools = [
+    ...new Set(
+      steps
+        .filter((step) => step.type === 'cross' || step.fromChainId !== step.toChainId)
+        .map((step) => step.toolName)
+        .filter(Boolean),
+    ),
+  ];
+
+  return {
+    id: route.id,
+    tool: route.tool,
+    bridgeTools,
+    fromAmount: route.estimate?.fromAmount,
+    toAmount: route.estimate?.toAmount,
+    toAmountMin: route.estimate?.toAmountMin,
+    fromAmountUSD: numberFromPath(route.estimate?.fromAmountUSD),
+    toAmountUSD: numberFromPath(route.estimate?.toAmountUSD),
+    executionDuration: route.estimate?.executionDuration || 0,
+    gasUsd: (route.estimate?.gasCosts || []).reduce(
+      (sum, item) => sum + numberFromPath(item.amountUSD),
+      0,
+    ),
+    feeUsd: (route.estimate?.feeCosts || []).reduce(
+      (sum, item) => sum + numberFromPath(item.amountUSD),
+      0,
+    ),
+    steps,
+  };
+}
+
+async function getRoutes(query) {
+  const fromChain = Number(query.fromChain || 8453);
+  const toChain = Number(query.toChain || 42161);
+  const symbol = String(query.symbol || 'USDC').toUpperCase();
+  const amount = String(query.amount || '1000');
+  const fromAddress =
+    query.fromAddress ||
+    '0x0000000000000000000000000000000000000001';
+
+  if (fromChain === toChain) {
+    throw new Error('请选择两条不同的链');
+  }
+
+  const tokens = await getLifiTokens();
+  const fromToken = chooseToken(tokens, fromChain, symbol);
+  const toToken = chooseToken(tokens, toChain, symbol);
+
+  if (!fromToken || !toToken) {
+    throw new Error(`当前链对暂时没有找到可用的 ${symbol} 跨链路径，可能需要选择 USDC、USD1，或确认该链上是否为 USDT0/桥接版本`);
+  }
+
+  const amountRaw = parseAmount(amount, fromToken.decimals);
+  const params = new URLSearchParams({
+    fromChain: String(fromChain),
+    toChain: String(toChain),
+    fromToken: fromToken.address,
+    toToken: toToken.address,
+    fromAmount: amountRaw,
+    fromAddress,
+    toAddress: fromAddress,
+    slippage: '0.003',
+  });
+
+  const cacheKey = `route-${fromChain}-${toChain}-${tokenKey(fromToken)}-${tokenKey(
+    toToken,
+  )}-${amountRaw}`;
+  const route = await cached(cacheKey, TTL.routes, () =>
+    fetchJson(`${LIFI_BASE}/quote?${params.toString()}`),
+  );
+
+  return {
+    updatedAt: new Date().toISOString(),
+    source: 'LI.FI Quote API',
+    request: {
+      fromChain,
+      toChain,
+      symbol,
+      amount: Number(amount),
+      fromToken: {
+        symbol: fromToken.symbol,
+        address: fromToken.address,
+        decimals: fromToken.decimals,
+      },
+      toToken: {
+        symbol: toToken.symbol,
+        address: toToken.address,
+        decimals: toToken.decimals,
+      },
+    },
+    route: summarizeRoute(route),
+  };
+}
+
+async function getYieldAssets() {
+  const tokens = YIELD_ASSETS.flatMap((asset) =>
+    asset.tokens.map((token) => `${token.chainId}:${token.address}`),
+  );
+  const data = await cached(`yield-assets-${tokens.join(',')}`, TTL.stablecoins, () =>
+    fetchJson(`https://coins.llama.fi/prices/current/${tokens.join(',')}`),
+  );
+
+  return {
+    updatedAt: new Date().toISOString(),
+    source: 'DeFiLlama Coins',
+    assets: YIELD_ASSETS.map((asset) => {
+      const rows = asset.tokens
+        .map((token) => {
+          const key = `${token.chainId}:${token.address}`;
+          const coin = data.coins?.[key];
+          return {
+            chainId: token.chainId,
+            chain: LIFI_CHAIN_LABELS.get(token.chainId) || token.chainId,
+            address: token.address,
+            price: numberFromPath(coin?.price),
+            confidence: numberFromPath(coin?.confidence),
+            timestamp: coin?.timestamp,
+          };
+        })
+        .filter((row) => row.price > 0);
+
+      return {
+        symbol: asset.symbol,
+        name: asset.name,
+        note: asset.note,
+        bestPrice: rows[0]?.price || 0,
+        chains: rows,
+      };
+    }),
+  };
+}
+
+async function getBinancePrices(pairs) {
+  if (!pairs.length) return new Map();
+
+  const encoded = encodeURIComponent(JSON.stringify(pairs));
+  const data = await cached(`binance-${pairs.join('-')}`, 20_000, () =>
+    fetchJson(`https://api.binance.com/api/v3/ticker/price?symbols=${encoded}`),
+  );
+  return new Map(data.map((item) => [item.symbol, numberFromPath(item.price)]));
+}
+
+function vwapFromOrderbook(levels, targetBaseAmount) {
+  let remaining = targetBaseAmount;
+  let cost = 0;
+  let filled = 0;
+
+  for (const [rawPrice, rawSize] of levels || []) {
+    const price = numberFromPath(rawPrice);
+    const size = numberFromPath(rawSize);
+    if (price <= 0 || size <= 0) continue;
+
+    const take = Math.min(remaining, size);
+    cost += take * price;
+    filled += take;
+    remaining -= take;
+    if (remaining <= 1e-12) break;
+  }
+
+  return {
+    vwap: filled > 0 ? cost / filled : 0,
+    filledBase: filled,
+    targetBase: targetBaseAmount,
+    complete: remaining <= 1e-12,
+  };
+}
+
+async function getBinanceExecutionPrices(pairs) {
+  const targets = pairs.filter((pair) => BINANCE_EXECUTION_BASE_SIZES.has(pair));
+  if (!targets.length) return new Map();
+
+  const entries = await Promise.all(
+    targets.map(async (pair) => {
+      try {
+        const data = await cached(`binance-depth-${pair}`, 10_000, () =>
+          fetchJson(`https://api.binance.com/api/v3/depth?symbol=${pair}&limit=100`),
+        );
+        const targetSize = BINANCE_EXECUTION_BASE_SIZES.get(pair);
+        const ask = vwapFromOrderbook(data.asks, targetSize);
+        if (ask.vwap <= 0 || !ask.complete) return null;
+        return [pair, { price: ask.vwap, targetSize, filledBase: ask.filledBase }];
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  return new Map(entries.filter(Boolean));
+}
+
+async function getBinanceTimeOffsetMs() {
+  try {
+    const data = await cached('binance-server-time', 30_000, () =>
+      fetchJson('https://api.binance.com/api/v3/time'),
+    );
+    binanceTimeOffsetMs = numberFromPath(data.serverTime) - Date.now();
+  } catch {
+    // Keep the last known offset if Binance time cannot be reached.
+  }
+  return binanceTimeOffsetMs;
+}
+
+async function getLlamaPrices(tokens) {
+  if (!tokens.length) return new Map();
+
+  const ids = tokens.map((token) => `${token.chainId}:${token.address}`);
+  const data = await cached(`llama-prices-${ids.join(',')}`, 20_000, () =>
+    fetchJson(`https://coins.llama.fi/prices/current/${ids.join(',')}`),
+  );
+  return new Map(
+    ids.map((id) => [id, numberFromPath(data.coins?.[id]?.price)]),
+  );
+}
+
+function binanceCredentials() {
+  const key = process.env.BINANCE_API_KEY || process.env.BINANCE_KEY || '';
+  const secret = process.env.BINANCE_API_SECRET || process.env.BINANCE_SECRET || '';
+  return { key, secret, ready: Boolean(key && secret) };
+}
+
+async function fetchBinanceSigned(path, params = {}) {
+  const credentials = binanceCredentials();
+  if (!credentials.ready) return null;
+
+  const timeOffsetMs = await getBinanceTimeOffsetMs();
+  const query = new URLSearchParams({
+    ...params,
+    timestamp: String(Date.now() + timeOffsetMs),
+    recvWindow: '60000',
+  });
+  const signature = crypto
+    .createHmac('sha256', credentials.secret)
+    .update(query.toString())
+    .digest('hex');
+  query.set('signature', signature);
+
+  return fetchJson(`https://api.binance.com${path}?${query.toString()}`, {
+    headers: {
+      'X-MBX-APIKEY': credentials.key,
+    },
+  });
+}
+
+function latestRateHistoryRow(payload) {
+  const rows = payload?.rows || payload?.data?.rows || payload?.data || [];
+  return Array.isArray(rows)
+    ? rows
+        .filter((row) => numberFromPath(row.exchangeRate) > 0)
+        .sort((a, b) => numberFromPath(b.time) - numberFromPath(a.time))[0] || null
+    : null;
+}
+
+async function getBinanceSignedRateReferences(assets) {
+  const targets = assets
+    .filter((asset) => BINANCE_SIGNED_RATE_ENDPOINTS.has(asset.symbol))
+    .map((asset) => asset.symbol);
+  const credentials = binanceCredentials();
+  if (!targets.length || !credentials.ready) return new Map();
+
+  const entries = await Promise.all(
+    targets.map(async (symbol) => {
+      const endpoint = BINANCE_SIGNED_RATE_ENDPOINTS.get(symbol);
+      try {
+        const data = await cached(`binance-signed-rate-${symbol}`, 60_000, () =>
+          fetchBinanceSigned(endpoint.path, { current: '1', size: '5' }),
+        );
+        const row = latestRateHistoryRow(data);
+        const value = numberFromPath(row?.exchangeRate);
+        if (value <= 0) return null;
+        return [
+          symbol,
+          {
+            value,
+            quality: 'Binance 官方签名接口',
+            label: `${endpoint.label}；最近记录年化 ${formatRateLabel(row?.annualPercentageRate)}，时间 ${formatTimestampLabel(row?.time)}`,
+          },
+        ];
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  return new Map(entries.filter(Boolean));
+}
+
+function formatRateLabel(value) {
+  const rate = numberFromPath(value, null);
+  if (rate === null) return '未返回';
+  return `${(rate * 100).toFixed(2)}%`;
+}
+
+function formatTimestampLabel(value) {
+  const time = numberFromPath(value);
+  if (!time) return '未返回';
+  return new Date(time).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+}
+
+async function getHashnoteUsycReference() {
+  try {
+    const data = await cached('hashnote-usyc-price', 60_000, () =>
+      fetchJson(HASHNOTE_USYC_PRICE_URL),
+    );
+    const row = Array.isArray(data?.data) ? data.data[0] : null;
+    const value = numberFromPath(row?.price);
+    if (value <= 0) return null;
+    return {
+      value,
+      quality: '官方公开接口',
+      label: `按 Hashnote USYC price report 最新 price 估算赎回/NAV 参考；round ${row.roundId || '-'}，更新时间 ${formatTimestampLabel(numberFromPath(row.timestamp) * 1000)}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getJupiterSolLstReference(symbol) {
+  const token = SOL_LST_MINTS.get(symbol);
+  if (!token) return null;
+
+  const amount = String(10n ** BigInt(token.decimals));
+  const params = new URLSearchParams({
+    inputMint: token.mint,
+    outputMint: SOL_MINT,
+    amount,
+    slippageBps: '30',
+  });
+  const data = await cached(`jupiter-sol-lst-${symbol}`, 30_000, () =>
+    fetchJson(`${JUPITER_QUOTE_URL}?${params.toString()}`),
+  );
+  const value = numberFromPath(data.outAmount) / 1e9;
+  if (value <= 0) return null;
+
+  const routeLabels = (data.routePlan || [])
+    .map((item) => item.swapInfo?.label)
+    .filter(Boolean);
+  return {
+    value,
+    quality: 'Jupiter 路由报价',
+    label: `按 Jupiter 1 ${symbol} -> SOL 可成交路由估算退出参考；路由 ${[...new Set(routeLabels)].join(' / ') || '未返回'}`,
+  };
+}
+
+async function getJupiterSolLstReferences(assets) {
+  const symbols = assets
+    .map((asset) => asset.symbol)
+    .filter((symbol) => SOL_LST_MINTS.has(symbol));
+
+  const entries = await Promise.all(
+    symbols.map(async (symbol) => {
+      try {
+        const reference = await getJupiterSolLstReference(symbol);
+        return reference ? [symbol, reference] : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  return new Map(entries.filter(Boolean));
+}
+
+async function getCoingeckoEthReferences(assets) {
+  const symbols = assets
+    .map((asset) => asset.symbol)
+    .filter((symbol) => COINGECKO_ETH_REFERENCES.has(symbol));
+  if (!symbols.length) return new Map();
+
+  const ids = symbols.map((symbol) => COINGECKO_ETH_REFERENCES.get(symbol).id);
+  try {
+    const params = new URLSearchParams({
+      ids: ids.join(','),
+      vs_currencies: 'eth',
+    });
+    const data = await cached(`coingecko-eth-${ids.join(',')}`, 60_000, () =>
+      fetchJson(`${COINGECKO_SIMPLE_PRICE_URL}?${params.toString()}`),
+    );
+
+    return new Map(
+      symbols
+        .map((symbol) => {
+          const config = COINGECKO_ETH_REFERENCES.get(symbol);
+          const value = numberFromPath(data?.[config.id]?.eth);
+          if (value <= 0) return null;
+          return [
+            symbol,
+            {
+              value,
+              quality: '公开价格参考',
+              label: config.label,
+            },
+          ];
+        })
+        .filter(Boolean),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+async function getExternalRedemptionReferences(assets, options = {}) {
+  const includeBinanceSignedRates = options.includeBinanceSignedRates !== false;
+  const [binanceRates, solLstRates, coingeckoEthRates, usycRate] = await Promise.all([
+    includeBinanceSignedRates ? getBinanceSignedRateReferences(assets) : new Map(),
+    getJupiterSolLstReferences(assets),
+    getCoingeckoEthReferences(assets),
+    getHashnoteUsycReference(),
+  ]);
+
+  const references = new Map([...binanceRates, ...solLstRates, ...coingeckoEthRates]);
+  if (usycRate) references.set('USYC', usycRate);
+  return references;
+}
+
+async function callRpc(chainId, method, params) {
+  const rpcUrl = RPC_URLS.get(chainId);
+  if (!rpcUrl) throw new Error(`No RPC configured for chain ${chainId}`);
+
+  const data = await cached(
+    `rpc-${chainId}-${method}-${JSON.stringify(params)}`,
+    30_000,
+    () =>
+      fetchJson(rpcUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method,
+          params,
+        }),
+      }),
+  );
+
+  if (data.error) throw new Error(data.error.message || 'RPC call failed');
+  return data.result;
+}
+
+function encodeUint256(value) {
+  return BigInt(value).toString(16).padStart(64, '0');
+}
+
+async function getErc4626Reference(reference) {
+  const amount = 10n ** BigInt(reference.decimals || 18);
+  const result = await callRpc(reference.chainId, 'eth_call', [
+    {
+      to: reference.address,
+      data: `${ERC4626_CONVERT_TO_ASSETS_SELECTOR}${encodeUint256(amount)}`,
+    },
+    'latest',
+  ]);
+
+  if (!result || result === '0x') return null;
+  const value = Number(BigInt(result)) / 10 ** (reference.decimals || 18);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+async function getContractReference(reference) {
+  const result = await callRpc(reference.chainId, 'eth_call', [
+    {
+      to: reference.address,
+      data: reference.selector,
+    },
+    'latest',
+  ]);
+
+  if (!result || result === '0x') return null;
+  const value = Number(BigInt(result)) / 10 ** (reference.decimals || 18);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+async function getOnchainReferences(assets) {
+  const entries = await Promise.all(
+    assets
+      .filter((asset) => {
+        const reference = referenceConfig(asset);
+        return reference.type === 'erc4626' || reference.type === 'contract';
+      })
+      .map(async (asset) => {
+        const reference = referenceConfig(asset);
+        try {
+          const value =
+            reference.type === 'contract'
+              ? await getContractReference(reference)
+              : await getErc4626Reference(reference);
+          return [`${asset.symbol}-${reference.address}`, value];
+        } catch {
+          return [`${asset.symbol}-${reference.address}`, null];
+        }
+      }),
+  );
+
+  return new Map(entries);
+}
+
+async function getRedemptionSpreads() {
+  const redemptionAssets = ACTIVE_REDEMPTION_ASSETS;
+  const binancePairs = redemptionAssets
+    .filter((asset) => asset.market.type === 'binance')
+    .map((asset) => asset.market.pair);
+  const llamaTokens = redemptionAssets
+    .filter((asset) => asset.market.type === 'llama')
+    .map((asset) => asset.market);
+
+  const [
+    binancePrices,
+    binanceExecutionPrices,
+    llamaPrices,
+    lifiTokens,
+    onchainReferences,
+    externalReferences,
+    pendleMarkets,
+  ] = await Promise.all([
+    getBinancePrices(binancePairs),
+    getBinanceExecutionPrices(binancePairs),
+    getLlamaPrices(llamaTokens),
+    getRedemptionLifiTokens(),
+    getOnchainReferences(redemptionAssets),
+    getExternalRedemptionReferences(redemptionAssets, { includeBinanceSignedRates: false }),
+    getPendleMarkets().catch(() => ({ markets: [] })),
+  ]);
+  const signedReferences = await getBinanceSignedRateReferences(redemptionAssets);
+  for (const [symbol, reference] of signedReferences) {
+    externalReferences.set(symbol, reference);
+  }
+
+  const assets = redemptionAssets.map((asset) => {
+    let marketPrice = 0;
+    let marketToken = null;
+    let executionMarket = null;
+    if (asset.market.type === 'binance') {
+      executionMarket = binanceExecutionPrices.get(asset.market.pair) || null;
+      marketPrice = executionMarket?.price || binancePrices.get(asset.market.pair) || 0;
+    }
+    if (asset.market.type === 'llama') {
+      marketPrice = llamaPrices.get(`${asset.market.chainId}:${asset.market.address}`) || 0;
+    }
+    if (asset.market.type === 'lifi-token') {
+      marketToken = chooseLifiToken(lifiTokens, asset.market.chainId, asset.market.symbol);
+      marketPrice = numberFromPath(marketToken?.priceUSD);
+    }
+    if (asset.market.type === 'manual') {
+      marketPrice = numberFromPath(asset.market.price);
+    }
+    const originalMarketPrice = marketPrice;
+    marketPrice = applyMarketOverrides(asset, marketPrice);
+
+    const effectiveReference = referenceConfig(asset);
+    const marketQuote =
+      asset.market.quote ||
+      (
+        asset.market.type === 'lifi-token' || asset.market.type === 'llama'
+          ? 'USD'
+          : effectiveReference.quote || 'USD'
+      );
+    const referenceQuote = effectiveReference.quote || asset.market.quote || 'USD';
+    let normalizedMarketPrice = normalizeMarketPrice(
+      marketPrice,
+      marketQuote,
+      referenceQuote,
+      lifiTokens,
+    );
+
+    let referencePrice = effectiveReference.value || 0;
+    if (effectiveReference.type === 'same-as-market') referencePrice = normalizedMarketPrice || 0;
+    if (effectiveReference.type === 'binance-market') referencePrice = normalizedMarketPrice || 0;
+    if (effectiveReference.type === 'erc4626' || effectiveReference.type === 'contract') {
+      referencePrice =
+        onchainReferences.get(`${asset.symbol}-${effectiveReference.address}`) || 0;
+    }
+    if (effectiveReference.type === 'unknown-rate') referencePrice = 0;
+    if (referencePrice <= 0 && normalizedMarketPrice > 0) referencePrice = normalizedMarketPrice;
+    const needsExecutionMarket =
+      asset.market.type === 'binance' &&
+      BINANCE_EXECUTION_BASE_SIZES.has(asset.market.pair);
+    const missingExecutionMarket = needsExecutionMarket && !executionMarket;
+    const usedMarketFallback =
+      referencePrice > 0 &&
+      effectiveReference.type === 'unknown-rate' &&
+      normalizedMarketPrice > 0 &&
+      referencePrice === normalizedMarketPrice;
+    const usedReferenceFallback =
+      referencePrice > 0 &&
+      effectiveReference.type !== 'unknown-rate' &&
+      normalizedMarketPrice > 0 &&
+      referencePrice === normalizedMarketPrice;
+    const wasReferenceMissing = referencePrice <= 0 || usedMarketFallback;
+    const overrideReference = externalReferenceFor(asset, externalReferences) ||
+      fallbackRedemptionReference(asset);
+    referencePrice = applyRedemptionOverrides(asset, referencePrice, externalReferences);
+    let waitDays = redemptionWaitDays(asset);
+    let pendleMarket = null;
+    if (isPendleAsset(asset)) {
+      const pendle = applyPendleData(
+        asset,
+        marketPrice,
+        referencePrice,
+        waitDays,
+        pendleMarkets,
+      );
+      marketPrice = pendle.marketPrice;
+      referencePrice = pendle.referencePrice;
+      waitDays = pendle.waitDays;
+      pendleMarket = pendle.pendleMarket;
+      normalizedMarketPrice = normalizeMarketPrice(
+        marketPrice,
+        marketQuote,
+        referenceQuote,
+        lifiTokens,
+      );
+    }
+
+    const spreadPct =
+      referencePrice > 0 && normalizedMarketPrice > 0
+        ? ((referencePrice - normalizedMarketPrice) / referencePrice) * 100
+        : null;
+    const quality = overrideReference?.quality ||
+      referenceQuality(asset, referencePrice, wasReferenceMissing);
+    const conservativeReason = conservativePolicyFor(asset, quality);
+    const executionCaution = conservativeReason
+      ? null
+      : executionCautionFor(asset, asset.market.type, executionMarket);
+    const isExecutable = !usedReferenceFallback && !conservativeReason && !missingExecutionMarket && !executionCaution;
+    const annualizedPct = isExecutable ? annualizedFromSpread(spreadPct, waitDays) : null;
+    const tag = executableOpportunityTag(
+      asset,
+      spreadPct,
+      missingExecutionMarket || executionCaution ? null : annualizedPct,
+      quality,
+      usedReferenceFallback || missingExecutionMarket || Boolean(executionCaution),
+    );
+    const score = scoreRedemptionOpportunity({
+      asset,
+      spreadPct,
+      annualizedPct,
+      quality,
+      isExecutable,
+      missingExecutionMarket,
+      conservativeReason,
+      executionCaution,
+    });
+    const adjustedReferenceLabel = [
+      overrideReference
+        ? overrideReference.label
+        :
+        effectiveReference.type === 'unknown-rate' && referencePrice === normalizedMarketPrice
+          ? `${asset.reference.label}；当前先用市场隐含值兜底，不作为官方赎回率`
+          : effectiveReference.label,
+      conservativeReason ? `口径收紧：${conservativeReason}，不计入 A0/A1 复核和年化` : null,
+      executionCaution ? `口径收紧：${executionCaution}，不计入 A0/A1 复核和年化` : null,
+    ].filter(Boolean).join('；');
+
+    return {
+      symbol: asset.symbol,
+      name: asset.name,
+      kind: asset.kind,
+      showInFocus: shouldShowInRedemptionFocus({
+        symbol: asset.symbol,
+        annualizedPct,
+        opportunityLevel: score.opportunityLevel,
+      }),
+      source: asset.source,
+      quote: referenceQuote,
+      marketQuote,
+      marketPrice,
+      normalizedMarketPrice,
+      marketQuality: executionMarket
+        ? `订单簿卖盘均价，约 ${executionMarket.targetSize} ${asset.symbol}`
+        : missingExecutionMarket
+          ? '待接订单簿成本，暂不进 A0/A1 复核'
+          : marketQuality(asset, originalMarketPrice, marketPrice),
+      redemptionReference: referencePrice,
+      referenceLabel: adjustedReferenceLabel,
+      referenceQuality: quality,
+      opportunityTag: tag,
+      opportunityScore: score.opportunityScore,
+      opportunityLevel: score.opportunityLevel,
+      opportunityReason: score.opportunityReason,
+      pendleMarket,
+      spreadPct,
+      annualizedPct,
+      waitDays,
+      opportunity:
+        missingExecutionMarket ? '待接订单簿成本' : opportunityText(asset, spreadPct, isExecutable),
+      wait: asset.wait,
+      redemptionPath: asset.redemptionPath,
+      entryUrl: asset.entryUrl,
+      marketChain: marketToken
+        ? LIFI_CHAIN_LABELS.get(marketToken.chainId) || marketToken.chainId
+        : undefined,
+    };
+  }).filter((asset) =>
+    asset.annualizedPct !== null &&
+    Number.isFinite(asset.annualizedPct) &&
+    asset.spreadPct !== null &&
+    asset.redemptionReference > 0 &&
+    asset.normalizedMarketPrice > 0
+  );
+
+  return {
+    updatedAt: new Date().toISOString(),
+    source: 'DeFiLlama Coins + Pendle official markets + public RPC',
+    assets,
+  };
+}
+
+// ============================================================================
+// 脱锚套利监控（2026-10-03 新增）：10 币种分链盯 DexScreener 价格，
+// 偏离 ±0.5% 预警 / ±1.5% 严重，经 PushPlus 推送；事件落盘 state/depeg_events.json
+// 供后续"新闻定性 + 套利路径"富化流程消费（enriched=false）。
+// 开关：DEPEG_MONITOR_ENABLED=1 才启动轮询（默认关闭，用户本地跑不受影响）。
+// 注意：Tron 等链上稳定币恒为 quote 端，用锚定法（TRX/BNB 的币安现货价 ÷ 链上锚定对 priceNative）反推。
+// ============================================================================
+const DEPEG_MONITOR_ENABLED = process.env.DEPEG_MONITOR_ENABLED === '1';
+const DEPEG_SCAN_INTERVAL_MS = Number(process.env.DEPEG_SCAN_INTERVAL_MS || 300_000);
+const DEPEG_WARN_BPS = Number(process.env.DEPEG_WARN_BPS || 50);
+const DEPEG_SEVERE_BPS = Number(process.env.DEPEG_SEVERE_BPS || 150);
+const DEPEG_CLEAR_BPS = Number(process.env.DEPEG_CLEAR_BPS || 30);
+const DEPEG_MIN_LIQ_USD = Number(process.env.DEPEG_MIN_LIQ_USD || 20_000);
+const DEPEG_PRICE_BAND = [0.5, 1.5]; //  sanity 带：过滤错报价；真崩盘（>50%）不在套利范围
+// 2026-10-25 用户拍板：metric 剔出触发源、只留观察。metric 已三度坏点假脱锚
+// （2026-10-23 ETH USDT -21.4% 假严重；2026-10-25 22:30 metric 两池同源自证放行 -810bps 假严重），
+// 且 DexScreener 对 ETH USDT 的 base 向采样常被 metric 占满。规则：
+// ①metric 池不得作同链复核副源；②metric 作主力时该腿标记 observeOnly，
+// 须非 metric 独立源（同链第二池 / GeckoTerminal 备用源）确认同向脱锚才建事件，
+// 否则只记 history 观察、不推送。metric 价格本身仍采集、仍上看板（观察）。
+const DEPEG_OBSERVE_ONLY_DEX = new Set(['metric']);
+const isObserveOnlyDex = (dex) => DEPEG_OBSERVE_ONLY_DEX.has(String(dex || '').toLowerCase());
+// 2026-10-28 用户立规：流动性不佳的池子不报。DEX 腿主池流动性 < $100,000 → 只观察：
+// 价格照常采集上看板，但不建事件、不重报、复核副源也必须 ≥ 此门槛（薄池不当法官、
+// 也不当证人）。真脱锚由该币的深池腿 / 交易所价格触发，不靠薄池。
+// 起因：USDD@Ethereum 的 Uniswap 池仅约 $49.5k，被砸到 −169bps 后趴着不恢复，
+// 12:03/12:33/13:03 连推三次，而 Tron 主池与 HTX/KuCoin/聚合价全部正常。
+const DEPEG_TRIGGER_MIN_LIQ_USD = Number(process.env.DEPEG_TRIGGER_MIN_LIQ_USD || 100_000);
+const DEPEG_STATE_FILE =
+  process.env.DEPEG_STATE_FILE || path.join(process.cwd(), 'state', 'depeg_events.json');
+const DEPEG_WARN_REPUSH_MS = Number(process.env.DEPEG_WARN_REPUSH_MS || 30 * 60_000);
+const DEPEG_SEVERE_REPUSH_MS = Number(process.env.DEPEG_SEVERE_REPUSH_MS || 15 * 60_000);
+const PUSHPLUS_TOKEN_FILE =
+  process.env.PUSHPLUS_TOKEN_FILE ||
+  path.join(process.env.HOME || '/home/hatch', 'workspace', 'dividend-detector', '.pushplus_token');
+
+// DEPEG_WATCH / BINANCE_FAST_LANES 见 depeg_logic.mjs（server.js 与回测脚本共用）
+
+
+
+const depegMonitorState = {
+  enabled: DEPEG_MONITOR_ENABLED,
+  checkedAt: null,
+  lastScanAt: null,
+  lastError: null,
+  activeCount: 0,
+};
+
+let pushplusTokenCache = null;
+function getPushplusToken() {
+  if (pushplusTokenCache !== null) return pushplusTokenCache;
+  const fromEnv = String(process.env.PUSHPLUS_TOKEN || '').trim();
+  if (fromEnv) {
+    pushplusTokenCache = fromEnv;
+    return pushplusTokenCache;
+  }
+  try {
+    pushplusTokenCache = fs.readFileSync(PUSHPLUS_TOKEN_FILE, 'utf8').trim() || null;
+  } catch {
+    pushplusTokenCache = null;
+  }
+  return pushplusTokenCache;
+}
+
+// PushPlus：JSON 不转义中文（JSON.stringify 默认输出 UTF-8），Content-Type 带 charset
+async function sendPushplus(title, content) {
+  const token = getPushplusToken();
+  if (!token) {
+    console.log('[depeg] pushplus token 缺失，跳过推送');
+    return { ok: false, reason: 'no-token' };
+  }
+  const response = await fetch('https://www.pushplus.plus/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ token, title, content, template: 'markdown' }),
+  });
+  const data = await response.json().catch(() => ({}));
+  console.log(`[depeg] pushplus -> code=${data.code} title=${title}`);
+  return { ok: data.code === 200, code: data.code };
+}
+
+// Bark（iPhone critical 穿透勿扰）：key 文件 ~/.bark_key，内容为 https://api.day.app/xxxx。
+// 未配置时直接返回 false，主流程不受影响。S/A 级事件调用。
+const BARK_KEY_FILE = path.join(process.env.HOME || '/home/hatch', '.bark_key');
+let barkKeyCache = null;
+function getBarkKey() {
+  if (barkKeyCache !== null) return barkKeyCache;
+  try {
+    const v = fs.readFileSync(BARK_KEY_FILE, 'utf8').trim().replace(/\/+$/, '');
+    barkKeyCache = v.startsWith('http') ? v : null;
+  } catch { barkKeyCache = null; }
+  return barkKeyCache;
+}
+async function sendBark(title, content) {
+  const base = getBarkKey();
+  if (!base) return { ok: false, reason: 'no-key' };
+  try {
+    const url = `${base}/push?title=${encodeURIComponent(title)}&body=${encodeURIComponent(String(content).slice(0, 800))}&level=critical&volume=10&sound=horn&badge=1`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'stablecoin-risk-desk/1.0' } });
+    console.log(`[depeg] bark -> status=${res.status} title=${title}`);
+    return { ok: res.status === 200, status: res.status };
+  } catch (e) {
+    console.log(`[depeg] bark 异常：${e.message}`);
+    return { ok: false, reason: e.message };
+  }
+}
+
+function loadDepegEvents() {
+  try {
+    const raw = fs.readFileSync(DEPEG_STATE_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.events) return parsed;
+  } catch {
+    // 文件不存在或损坏：从空开始
+  }
+  return { events: {}, history: [] };
+}
+
+function saveDepegEvents(state) {
+  fs.mkdirSync(path.dirname(DEPEG_STATE_FILE), { recursive: true });
+  fs.writeFileSync(DEPEG_STATE_FILE, JSON.stringify(state, null, 1));
+}
+
+async function depegDexPairs(dsChain, address) {
+  // 合并 tokens/v1（精确但只采样 1 个 pair）+ search（最多 30 个）再挑最深的；
+  // search 对个别地址会返回错链结果（如 USDT-eth 曾返回 30 个 pulsechain pair），按链过滤。
+  const seen = new Map();
+  const add = (pairs) => {
+    for (const p of pairs || []) {
+      if (p?.chainId !== dsChain) continue;
+      const key =
+        String(p.pairAddress || '').toLowerCase() ||
+        `${p.dexId}-${p?.baseToken?.address}-${p?.quoteToken?.address}`.toLowerCase();
+      if (!seen.has(key)) seen.set(key, p);
+    }
+  };
+  try {
+    const data = await fetchJson(
+      `https://api.dexscreener.com/tokens/v1/${dsChain}/${address}`,
+    );
+    add(Array.isArray(data) ? data : []);
+  } catch {
+    // 掉到 search
+  }
+  try {
+    const data = await fetchJson(
+      `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(address)}`,
+    );
+    add(Array.isArray(data?.pairs) ? data.pairs : []);
+  } catch {
+    // 两个源都失败就返回已拿到的
+  }
+  return [...seen.values()];
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function binanceSpotPrice(symbol) {
+  // data-api.binance.vision 为免墙的市场数据域名（fapi/api 主站 451）
+  const data = await fetchJson(
+    `https://data-api.binance.vision/api/v3/ticker/price?symbol=${symbol}`,
+  );
+  return numberFromPath(data.price);
+}
+
+function pickDirectPair(pairs, address, minLiq = DEPEG_MIN_LIQ_USD) {
+  const want = address.toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  const matched = pairs
+    .filter((p) => String(p?.baseToken?.address || '').toLowerCase() === want);
+  const inBand = matched
+    .map((p) => ({
+      price: numberFromPath(p.priceUsd),
+      liq: numberFromPath(p?.liquidity?.usd),
+      // 2026-10-03 池子失衡比先行指标：base 即我们的币（已按地址匹配），用 reserves 算我方占比
+      liqBase: numberFromPath(p?.liquidity?.base),
+      liqQuote: numberFromPath(p?.liquidity?.quote),
+      priceNative: numberFromPath(p.priceNative),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.price >= lo && p.price <= hi);
+  const ok = inBand
+    .filter((p) => p.liq >= minLiq)
+    .sort((a, b) => b.liq - a.liq)[0] || null;
+  if (ok && isObserveOnlyDex(ok.dex)) ok.observeOnly = true; // metric 只观察（见 DEPEG_OBSERVE_ONLY_DEX）
+  if (process.env.DEPEG_DEBUG === '1' && !ok) {
+    const best = inBand.sort((a, b) => b.liq - a.liq)[0];
+    console.log(`[depeg-debug] direct 无可用：addr=${address.slice(0, 10)} pairs=${pairs.length} base匹配=${matched.length} 带内=${inBand.length} 最佳=${best ? `${best.label} liq=${Math.round(best.liq)} px=${best.price}` : '无'}`);
+  }
+  return ok;
+}
+
+// 主力池不够深时退而求其次：用带内最深的池（标记 lowConfidence，不做降级报警的唯一依据）
+// 2026-10-28 池子审计追加：lenient 只接受 quote 为主流计价资产的池——
+// USDD/BBT（$709）这类奇异 quote 池的 USD 价由 quote 币自身价格折算，是双重垃圾报价，
+// 曾让 USDD@Tron 长期输出 -612bps 假偏差刷屏 history。
+const LENIENT_QUOTE_ALLOW = new Set([
+  'USDT', 'USDC', 'USD', 'TUSD', 'USDS', 'USDE', 'USD1', 'PYUSD', 'RLUSD', 'USDG',
+  'USDD', 'FDUSD', 'DAI', 'BUSD', 'WTRX', 'TRX', 'WBNB', 'BNB', 'WETH', 'ETH',
+  'WSOL', 'SOL',
+]);
+function pickDirectPairLenient(pairs, address) {
+  const sane = (pairs || []).filter((p) =>
+    LENIENT_QUOTE_ALLOW.has(String(p?.quoteToken?.symbol || '').toUpperCase()));
+  const best = pickDirectPair(sane, address, 0);
+  return best ? { ...best, lowConfidence: true } : null;
+}
+
+// 双源交叉验证：同链第二好的池（与主力池不同的 pairAddress，带内）。
+// 复核源门槛与触发门槛一致（≥ DEPEG_TRIGGER_MIN_LIQ_USD，2026-10-28 立规：薄池不当复核源，
+// 防 USDD@Ethereum 式"薄主池被另一个薄池报价确认"的同薄互证）。
+// 复核用，不额外调接口——pairs 已在 depegDexPairs 里一次拉回，快线零延迟。
+function pickSecondDirectPair(pairs, address, excludePairAddress, minLiq = DEPEG_TRIGGER_MIN_LIQ_USD) {
+  const want = address.toLowerCase();
+  const excl = String(excludePairAddress || '').toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  const cands = pairs
+    .filter((p) => String(p?.baseToken?.address || '').toLowerCase() === want)
+    .map((p) => ({
+      price: numberFromPath(p.priceUsd),
+      liq: numberFromPath(p?.liquidity?.usd),
+      liqBase: numberFromPath(p?.liquidity?.base),
+      liqQuote: numberFromPath(p?.liquidity?.quote),
+      priceNative: numberFromPath(p.priceNative),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.price >= lo && p.price <= hi && p.liq >= minLiq
+      && String(p.pairAddress || '').toLowerCase() !== excl
+      && !isObserveOnlyDex(p.dex)) // metric 不得作复核副源（防同源自证，2026-10-25）
+    .sort((a, b) => b.liq - a.liq);
+  return cands[0] || null;
+}
+
+// 2026-10-04 用户要求：副源（同链第二池）缺失时，用备用源复核。
+// 备用源 = GeckoTerminal 同链 top_pools（独立聚合器，仍是同链口径，
+// 不违反"链级信号必须同链复核、不能拿聚合价否决"的原则）。
+// 免费 30次/分钟；只在副源缺失时触发；失败/超时静默返回 null，不影响主流程。
+const GECKO_NET = { ethereum: 'eth', tron: 'tron', solana: 'solana', bsc: 'bsc', arbitrum: 'arbitrum', base: 'base' };
+async function geckoBackupSecond(dsChain, address, minLiq = DEPEG_TRIGGER_MIN_LIQ_USD) {
+  const net = GECKO_NET[dsChain];
+  if (!net) return null;
+  const want = String(address || '').toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  try {
+    const d = await fetchJson(
+      `https://api.geckoterminal.com/api/v2/networks/${net}/tokens/${address}?include=top_pools`,
+      { signal: AbortSignal.timeout(10000) });
+    for (const p of d?.included || []) {
+      const a = p?.attributes || {};
+      const rel = p?.relationships || {};
+      const baseAddr = String(rel?.base_token?.data?.id || '').split('_').pop().toLowerCase();
+      const quoteAddr = String(rel?.quote_token?.data?.id || '').split('_').pop().toLowerCase();
+      let price = null;
+      if (baseAddr === want) price = numberFromPath(a.base_token_price_usd);
+      else if (quoteAddr === want) price = numberFromPath(a.quote_token_price_usd);
+      if (!(price > 0)) continue;
+      const liq = numberFromPath(a.reserve_in_usd);
+      if (!(liq >= minLiq)) continue;
+      if (price < lo || price > hi) continue;
+      return { price, liq, dex: 'geckoterminal', label: `${a.name || 'pool'}(backup)`, backup: true };
+    }
+  } catch (error) {
+    console.log(`[depeg] 备用源复核失败 ${dsChain}：${error.message}`);
+  }
+  return null;
+}
+
+// 2026-10-28 池子审计新增：个别腿 DexScreener 采样不到真主池（如 USDD@Tron 只采样到
+// USDD/BBT $709 垃圾池，真主池 SunSwap V3 USDT/USDD $2.15M 只有 GeckoTerminal 可见）。
+// 这类腿在 DEPEG_WATCH 标 geckoPrimary: true，DS direct/anchor 都无果时用 GT top_pools
+// 中流动性 ≥ DEPEG_MIN_LIQ_USD 的最深池作主源（价格取该池 base/quote 侧 USD 价）。
+// 注意：GT 同时是备用复核源，故此腿 confirm 保持 null（不许同源自证，防 metric 式假确认）。
+async function geckoPrimaryPrice(dsChain, address) {
+  const net = GECKO_NET[dsChain];
+  if (!net) return null;
+  const want = String(address || '').toLowerCase();
+  const [lo, hi] = DEPEG_PRICE_BAND;
+  try {
+    const d = await fetchJson(
+      `https://api.geckoterminal.com/api/v2/networks/${net}/tokens/${address}?include=top_pools`,
+      { signal: AbortSignal.timeout(10000) });
+    let best = null;
+    for (const p of d?.included || []) {
+      const a = p?.attributes || {};
+      const rel = p?.relationships || {};
+      const baseAddr = String(rel?.base_token?.data?.id || '').split('_').pop().toLowerCase();
+      const quoteAddr = String(rel?.quote_token?.data?.id || '').split('_').pop().toLowerCase();
+      let price = null;
+      if (baseAddr === want) price = numberFromPath(a.base_token_price_usd);
+      else if (quoteAddr === want) price = numberFromPath(a.quote_token_price_usd);
+      if (!(price > 0)) continue;
+      const liq = numberFromPath(a.reserve_in_usd);
+      if (!(liq >= DEPEG_MIN_LIQ_USD)) continue;
+      if (price < lo || price > hi) continue;
+      if (!best || liq > best.liq) {
+        best = { price, liq, dex: 'geckoterminal', label: `${a.name || 'pool'}(gt-primary)` };
+      }
+    }
+    return best;
+  } catch (error) {
+    console.log(`[depeg] GT 主源拉取失败 ${dsChain}：${error.message}`);
+    return null;
+  }
+}
+
+function pickSecondAnchorPair(pairs, address, baseSymbol, excludePairAddress, minLiq = DEPEG_TRIGGER_MIN_LIQ_USD) {
+  const want = address.toLowerCase();
+  const wantBase = String(baseSymbol).toUpperCase();
+  const excl = String(excludePairAddress || '').toLowerCase();
+  const cands = pairs
+    .filter((p) => String(p?.quoteToken?.address || '').toLowerCase() === want)
+    .filter((p) => String(p?.baseToken?.symbol || '').toUpperCase() === wantBase)
+    .map((p) => ({
+      priceNative: numberFromPath(p.priceNative),
+      liq: numberFromPath(p?.liquidity?.usd),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.priceNative > 0 && p.liq >= minLiq
+      && String(p.pairAddress || '').toLowerCase() !== excl
+      && !isObserveOnlyDex(p.dex)) // metric 不得作复核副源（2026-10-25）
+    .sort((a, b) => b.liq - a.liq);
+  return cands[0] || null;
+}
+
+function pickAnchorPair(pairs, address, baseSymbol) {
+  const want = address.toLowerCase();
+  const wantBase = String(baseSymbol).toUpperCase();
+  return pairs
+    .filter((p) => String(p?.quoteToken?.address || '').toLowerCase() === want)
+    .filter((p) => String(p?.baseToken?.symbol || '').toUpperCase() === wantBase)
+    .map((p) => ({
+      priceNative: numberFromPath(p.priceNative),
+      liq: numberFromPath(p?.liquidity?.usd),
+      dex: p.dexId,
+      pairAddress: p.pairAddress,
+      label: `${p?.baseToken?.symbol}/${p?.quoteToken?.symbol}`,
+    }))
+    .filter((p) => p.priceNative > 0 && p.liq >= DEPEG_MIN_LIQ_USD)
+    .sort((a, b) => b.liq - a.liq)[0] || null;
+}
+
+async function getDepegLegPrices() {
+  // 逐地址走 DexScreener search（最多 30 个 pair/地址），一轮约 26 个请求
+  const byChain = new Map();
+  for (const coin of DEPEG_WATCH) {
+    for (const leg of coin.legs) {
+      const list = byChain.get(leg.ds) || [];
+      list.push({ coin: coin.symbol, leg });
+      byChain.set(leg.ds, list);
+    }
+  }
+  const anchorPrices = new Map(); // cexSymbol -> price
+  const out = [];
+  for (const [dsChain, items] of byChain) {
+    for (const { coin, leg } of items) {
+      let pairs = [];
+      try {
+        pairs = await depegDexPairs(dsChain, leg.address);
+      } catch (error) {
+        console.log(`[depeg] 拉取 ${coin}@${leg.chain} 失败：${error.message}`);
+      }
+      await sleep(250); // 给免费接口留气口，避免被限流返回残缺数据
+      const direct = pickDirectPair(pairs, leg.address);
+      if (direct) {
+        // 双源交叉：同链第二池（已拉回的数据，零额外延迟）；
+        // 缺失时用 GeckoTerminal 同链 top_pools 做备用复核（2026-10-04 用户要求）
+        let second = pickSecondDirectPair(pairs, leg.address, direct.pairAddress);
+        // 2026-10-04：备用源只在"主源真有脱锚信号"时才查（GeckoTerminal 免费 30次/分钟，
+        // 全量查会 429；无脱锚时复核结论用不上，省掉调用）
+        if (!second && Math.abs((direct.price - 1) * 10_000) >= DEPEG_WARN_BPS) {
+          second = await geckoBackupSecond(leg.ds, leg.address);
+        }
+        // 池子失衡比先行指标（2026-10-03）：用主力池 reserves 算，不新增请求
+        const imb = poolImbalance(direct.liqBase, direct.liqQuote, direct.price, direct.priceNative);
+        out.push({ symbol: coin, chain: leg.chain, price: direct.price,
+          liq: direct.liq, dex: direct.dex, pair: direct.label, method: 'direct',
+          observeOnly: Boolean(direct.observeOnly),
+          poolImbalance: imb === null ? null : Math.round(imb * 10) / 10,
+          imbalanceSig: imbalanceSignal(imb),
+          confirmPrice: second ? second.price : null,
+          confirmDevBps: second ? (second.price - 1) * 10_000 : null,
+          confirmSrc: second ? `${second.dex} ${second.label}` : null });
+        continue;
+      }
+      // 2026-10-28 池子审计：标 geckoPrimary 的腿（DexScreener 采样不到真主池，
+      // 如 USDD@Tron）先用 GeckoTerminal 主源；confirm 留空，不许同源自证。
+      if (leg.geckoPrimary) {
+        const gp = await geckoPrimaryPrice(leg.ds, leg.address);
+        if (gp) {
+          out.push({ symbol: coin, chain: leg.chain, price: gp.price,
+            liq: gp.liq, dex: gp.dex, pair: gp.label, method: 'gecko-primary',
+            confirmPrice: null, confirmDevBps: null, confirmSrc: null });
+          continue;
+        }
+      }
+      if (leg.anchor) {
+        const ap = pickAnchorPair(pairs, leg.address, leg.anchor.baseSymbol);
+        if (ap) {
+          if (!anchorPrices.has(leg.anchor.cexSymbol)) {
+            try {
+              anchorPrices.set(leg.anchor.cexSymbol, await binanceSpotPrice(leg.anchor.cexSymbol));
+            } catch (error) {
+              console.log(`[depeg] 锚定价 ${leg.anchor.cexSymbol} 拉取失败：${error.message}`);
+              anchorPrices.set(leg.anchor.cexSymbol, 0);
+            }
+          }
+          const anchorPx = anchorPrices.get(leg.anchor.cexSymbol);
+          if (anchorPx > 0) {
+            let ap2 = pickSecondAnchorPair(pairs, leg.address, leg.anchor.baseSymbol, ap.pairAddress);
+            // 副源缺失时用备用源：GeckoTerminal 同链池的直接 USD 价（2026-10-04 用户要求）；
+            // 只在主源真有脱锚信号时查（省免费额度，防 429）
+            let backupPx = null;
+            if (!ap2 && Math.abs((anchorPx / ap.priceNative - 1) * 10_000) >= DEPEG_WARN_BPS) {
+              const bk = await geckoBackupSecond(leg.ds, leg.address);
+              if (bk) { backupPx = bk.price; ap2 = bk; }
+            }
+            const cPrice = ap2 ? (backupPx !== null ? backupPx : anchorPx / ap2.priceNative) : null;
+            out.push({ symbol: coin, chain: leg.chain, price: anchorPx / ap.priceNative,
+              liq: ap.liq, dex: ap.dex, pair: ap.label, method: `anchor(${leg.anchor.baseSymbol})`,
+              confirmPrice: cPrice,
+              confirmDevBps: cPrice !== null ? (cPrice - 1) * 10_000 : null,
+              confirmSrc: ap2 ? (backupPx !== null
+                ? `${ap2.dex} ${ap2.label}`
+                : `${ap2.dex} ${ap2.label}(anchor)`) : null });
+            continue;
+          }
+        }
+      }
+      // 主力池不够深时退而求其次：带内最深池（低置信度，仅作参考）。
+      // 2026-10-28 顺序调整：lenient 排在 geckoPrimary 与 anchor 之后——
+      // 此前 lenient 抢在 anchor 前面，让 USDD@Tron 的 $709 垃圾池永远截胡锚定法。
+      const lenient = pickDirectPairLenient(pairs, leg.address);
+      if (lenient) {
+        let second = pickSecondDirectPair(pairs, leg.address, lenient.pairAddress);
+        // 2026-10-04：同上，备用源只在主源真有脱锚信号时查
+        if (!second && Math.abs((lenient.price - 1) * 10_000) >= DEPEG_WARN_BPS) {
+          second = await geckoBackupSecond(leg.ds, leg.address);
+        }
+        out.push({ symbol: coin, chain: leg.chain, price: lenient.price,
+          liq: lenient.liq, dex: lenient.dex, pair: lenient.label,
+          method: 'direct(low-liq)', lowConfidence: true, observeOnly: Boolean(lenient.observeOnly),
+          confirmPrice: second ? second.price : null,
+          confirmDevBps: second ? (second.price - 1) * 10_000 : null,
+          confirmSrc: second ? `${second.dex} ${second.label}` : null });
+        continue;
+      }
+      out.push({ symbol: coin, chain: leg.chain, price: 0, liq: 0, dex: null, pair: null,
+        method: 'no-data', error: '无可用报价' });
+    }
+  }
+  return out;
+}
+
+function depegLevel(devBps) {
+  return classifyDepeg(devBps, DEPEG_WARN_BPS, DEPEG_SEVERE_BPS);
+}
+
+// 初版最快路径推荐见 depeg_logic.mjs fastestArbPath（供慢线 enrich 流程调用）
+
+// 快线推送：raw 报警（币种/链/偏离/级别），不等待新闻核实；
+// 慢线（新闻定性+套利路径）由 enrich 流程消费 depeg_events.json 后补发。
+// 事件评级 S/A/B/C：峰值/持续/双源/广度 → gradeDepegEvent（规则见 depeg_logic.mjs）。
+// breadth live 口径：store.events 里同币≥2 条活跃链 → multi-chain，否则 single；
+// live 无币安现货参考价，whole-coin 不在快线使用（由慢线/回测判定）。
+function gradeLiveEvent(event, store) {
+  const chains = new Set();
+  for (const k of Object.keys((store && store.events) || {})) {
+    const e = store.events[k];
+    if (e && e.status === 'active' && e.symbol === event.symbol) chains.add(e.chain);
+  }
+  chains.add(event.chain);
+  const breadth = chains.size >= 2 ? 'multi-chain' : 'single';
+  const durHours = event.firstSeen ? (Date.now() - new Date(event.firstSeen).getTime()) / 3600 : 0;
+  const grade = gradeDepegEvent({
+    peakDevBps: Math.abs(event.peakDevBps ?? event.devBps ?? 0),
+    durHours,
+    verdict: event.confirm || 'unconfirmed',
+    breadth,
+  });
+  // 2026-10-03 用户要求：S 级多链联动可能是暴雷（基本面），推送必须明确是风险警告而非机会
+  event.breadth = breadth;
+  return grade;
+}
+
+// 带评级的快线推送：标题前缀 [S]/[A]/[B]/[C]；S/A 级额外走 Bark critical
+// （~/.bark_key 未配置则静默跳过，不影响 PushPlus 主流程）。
+// 2026-10-03 用户要求：半夜（00:00–08:00 北京时间）Bark 只在偏离 ≥5% 时触发，
+// 微信（PushPlus）全天按正常阈值推送。事件照常跟踪。
+// 2026-10-20 用户要求：半夜脱锚一律不走 Bark（之前是偏离 ≥5% 才响，现已停用）
+const NIGHT_BARK_MIN_BPS = 500; // 已停用，保留作记录
+function isNightQuietHours() {
+  const h = Number(new Date().toLocaleString('en-US',
+    { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }));
+  return h >= 0 && h < 8;
+}
+// 2026-10-04 用户要求：08:00–10:00 早上完全静默，任何推送都不发
+function isMorningQuietHours() {
+  const h = Number(new Date().toLocaleString('en-US',
+    { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }));
+  return h >= 8 && h < 10;
+}
+async function pushDepegWithGrade(store, event, kind, titleCore) {
+  // 2026-10-04 用户澄清：08:00–10:00 严重脱锚照常推送（白天规则），只有预警级压到 10 点
+  const isSeverePush = kind === 'severe' || event.level === 'severe';
+  if (isMorningQuietHours() && !isSeverePush) {
+    console.log(`[depeg] 早上静默（08:00–10:00）预警级不推：${event.symbol}@${event.chain} ${event.devBps}bps`);
+    return { ok: false, quiet: true };
+  }
+  const grade = gradeLiveEvent(event, store);
+  event.grade = grade;
+  event.gradedAt = new Date().toISOString();
+  // 2026-10-04 用户要求（23:20 明确范围：仅 USDe@Solana）：单池 warn 级小折价不推送——
+  // $10k 在 PumpSwap constant-product 池滑点约 80bps，59bps 级折价扣掉双边滑点后无利可图；
+  // 只跟踪不推送，升级到 severe 才推。其他币种/链不受影响。
+  const isUsdeSolSmallDisc = event.symbol === 'USDe' && event.chain === 'Solana'
+    && event.breadth === 'single' && !isSeverePush && kind !== 'resolved';
+  if (isUsdeSolSmallDisc) {
+    console.log(`[depeg] USDe@Solana 单池 warn 级小折价不推送（用户要求）：${event.devBps}bps，只跟踪`);
+    return { ok: false, quiet: true };
+  }
+  // S 级多链联动：标题明确标风险，避免误读为大机会
+  const tag = (grade === 'S' && event.breadth === 'multi-chain') ? 'S-风险' : grade;
+  const title = `[${tag}] ${titleCore}`;
+  const body = formatDepegPush({ ...event, grade }, kind);
+  const r = await sendPushplus(title, body);
+  // Bark：白天 S/A 级照常；半夜（00:00–08:00）2026-10-20 用户要求：脱锚一律不走 Bark，只微信
+  // 2026-10-28 补豁免：USDD 报警只走微信、绝不 Bark（用户两次确认，HTX 风险顾虑下 USDD
+  // 单所脱锚也不例外）。此前逻辑无此豁免，2026-10-28 13:03 USDD@Ethereum 升级为严重时
+  // 仍推了 Bark，系缺口，本次补上。
+  const barkExempt = event.symbol === 'USDD';
+  const nightOk = !isNightQuietHours();
+  if ((grade === 'S' || grade === 'A') && kind !== 'resolved' && nightOk && !barkExempt) {
+    await sendBark(title, body);
+  } else if ((grade === 'S' || grade === 'A') && kind !== 'resolved' && barkExempt) {
+    console.log(`[depeg] USDD 不走 Bark（用户要求，只微信）：${event.symbol}@${event.chain} ${event.devBps}bps`);
+  } else if ((grade === 'S' || grade === 'A') && kind !== 'resolved') {
+    console.log(`[depeg] 半夜 Bark 不响（用户要求）：${event.symbol}@${event.chain} ${event.devBps}bps`);
+  }
+  return r;
+}
+function formatDepegPush(event, kind) {
+  const dir = event.devBps < 0 ? '折价' : '溢价';
+  const head = kind === 'resolved' ? '✅ 脱锚解除'
+    : kind === 'severe' ? '🚨 稳定币严重脱锚'
+    : '⚠️ 稳定币脱锚预警';
+  const lines = [
+    `${head}：${event.symbol} @ ${event.chain}`,
+    ``,
+    `- 链上价：$${event.price.toFixed(4)}（${dir} ${Math.abs(event.devBps).toFixed(1)} bps）`,
+    `- 报价源：${event.method}，${event.dex || '-'} ${event.pair || ''}，池流动性 $${Math.round(event.liq).toLocaleString()}`,
+    `- 级别：${event.level === 'severe' ? '严重（≥1.5%）' : '预警（≥0.5%）'}；首次发现 ${event.firstSeen}`,
+  ];
+  // 双源交叉验证标注（快线零延迟：副源已在扫描中取回）
+  if (event.confirm === 'confirmed') {
+    lines.push(`- 双源复核：✅ 同链第二池确认（${event.confirmSrc || ''}）`);
+  } else if (event.confirm === 'likely') {
+    lines.push(`- 双源复核：◐ 同链第二池大概率确认（${event.confirmSrc || ''}）`);
+  } else if (kind !== 'resolved') {
+    lines.push(`- 双源复核：⚠️ 单源报价（无可用第二池），动手前请自行复核`);
+  }
+  if (event.lowConfidence) {
+    lines.push(`- ⚠️ 报价池较浅（$${Math.round(event.liq).toLocaleString()}），价格仅供参考，动手前请自行复核`);
+  }
+  // 池子失衡比先行指标（2026-10-03）：极端失衡可能是价格脱锚的先行信号，仅标注不单独报警
+  if (event.imbalanceSig === 'sell-pressure') {
+    lines.push(`- 📊 池子失衡：${event.symbol} 占池内价值 ${event.poolImbalance}%（≥65%），被持续卖入池子，警惕进一步折价`);
+  } else if (event.imbalanceSig === 'buy-pressure') {
+    lines.push(`- 📊 池子失衡：${event.symbol} 占池内价值 ${event.poolImbalance}%（≤35%），被持续买走，警惕溢价`);
+  }
+  if (event.grade) {
+    lines.push(`- 严重程度评级：[${event.grade}] ${GRADE_LABEL[event.grade] || ''}`);
+  }
+  // 2026-10-03 分级绑定动作（借鉴 pegcheck）：每个级别直接给建议动作，不只评严重度
+  if (kind !== 'resolved') {
+    const action = event.grade === 'S' && event.breadth === 'multi-chain'
+      ? '⛔ 别碰：疑似基本面事件，等慢线定性'
+      : event.grade === 'S'
+        ? '🎯 按慢线补发的最快路径执行，注意分批、确认充提开放'
+        : event.grade === 'A'
+          ? '👀 跟踪：持续观察，回到 ±0.3% 内自动解除'
+          : event.grade === 'B'
+            ? '📝 观察：暂不操作，留意是否升级'
+            : '📝 记录：无需操作';
+    lines.push(`- 建议动作：${action}`);
+  }
+  // 2026-10-03 用户要求：S 级多链联动疑似暴雷（基本面），快线必须明确这是风险警告而非套利机会；
+  // 风险提示已并入上面的"建议动作"行，这里只保留慢线补发说明。
+  if (!(event.grade === 'S' && event.breadth === 'multi-chain') && kind !== 'resolved') {
+    lines.push(`- 新闻定性与套利路径随后补发（慢线）`);
+  } else if (kind === 'resolved') {
+    lines.push(`- 偏离已回到 ±${(DEPEG_CLEAR_BPS / 100).toFixed(2)}% 以内`);
+  }
+  return lines.join('\n');
+}
+
+// 逐所盯跌层（cex_dip_watch）自轮询取用的最近一轮 DEX 锚腿（每次主扫描刷新）
+let lastDepegLegs = [];
+
+async function scanDepegMonitor() {
+  depegMonitorState.checkedAt = new Date().toISOString();
+  let legs;
+  try {
+    legs = await getDepegLegPrices();
+  } catch (error) {
+    depegMonitorState.lastError = error.message;
+    console.log(`[depeg] 扫描失败：${error.message}`);
+    return;
+  }
+  lastDepegLegs = legs;
+
+  const store = loadDepegEvents();
+  const now = Date.now();
+  const nowIso = new Date().toISOString();
+  const seen = new Set();
+
+  for (const leg of legs) {
+    const key = `${leg.symbol}:${leg.chain}`;
+    if (!leg.price) continue; // 无数据：保持原事件不动
+    seen.add(key);
+    const devBps = ((leg.price - 1) / 1) * 10_000;
+    const level = depegLevel(devBps);
+    const prev = store.events[key];
+
+    if (!level) {
+      // 回到阈值内：解除
+      if (prev && prev.status === 'active' && isCleared(devBps, DEPEG_CLEAR_BPS)) {
+        prev.status = 'resolved';
+        prev.resolvedAt = nowIso;
+        prev.clearDevBps = Math.round(devBps * 10) / 10;
+        store.history.unshift({ ...prev });
+        store.history = store.history.slice(0, 200);
+        delete store.events[key];
+        if (!prev.grade) prev.grade = gradeLiveEvent({ ...prev, status: 'active' }, { events: {} });
+        // 2026-10-04：半夜解除也不推（不是急事），只记日志
+        if (isNightQuietHours()) {
+          console.log(`[depeg] ${key} 脱锚解除（半夜不推）`);
+        } else if (!prev.lastPushAt) {
+          // 2026-10-04：此前没推送过的事件（warn 小折价被压住等），解除也不打扰用户
+          console.log(`[depeg] ${key} 脱锚解除（此前未推送，不打扰）`);
+        } else {
+          await pushDepegWithGrade({ events: {} },
+            { ...prev, devBps, price: leg.price, status: 'active' }, 'resolved',
+            `✅ ${leg.symbol}@${leg.chain} 脱锚解除`);
+        }
+      }
+      continue;
+    }
+
+    if (!prev || prev.status !== 'active') {
+      // 新事件：双源交叉验证（副源价格已在扫描中取回，零额外延迟）
+      const verdict = confirmDepeg(devBps, leg.confirmDevBps ?? null, DEPEG_WARN_BPS);
+      // metric 只观察（2026-10-25 用户拍板）：主力是观察源时，非 metric 独立源未确认
+      // 同向脱锚（verdict !== 'confirmed'）一律不建事件、不推送，只记 history 备查
+      if (leg.observeOnly && verdict !== 'confirmed') {
+        store.history.unshift({
+          key, symbol: leg.symbol, chain: leg.chain,
+          price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+          devBps: Math.round(devBps * 10) / 10, level,
+          confirmDevBps: leg.confirmDevBps === null || leg.confirmDevBps === undefined
+            ? null : Math.round(leg.confirmDevBps * 10) / 10,
+          confirmSrc: leg.confirmSrc || null,
+          firstSeen: nowIso, status: 'observe-only',
+          note: '主力源为观察源（metric，只观察不触发），独立源未确认同向脱锚，仅记录不推送',
+        });
+        store.history = store.history.slice(0, 200);
+        console.log(`[depeg] ${key} 观察源偏差不触发：主 ${devBps.toFixed(1)}bps（${leg.dex} ${leg.pair || ''}）/ 独立源 ${leg.confirmDevBps === null || leg.confirmDevBps === undefined ? '无' : leg.confirmDevBps.toFixed(1) + 'bps'}（${leg.confirmSrc || '无'}）`);
+        continue;
+      }
+      if (verdict === 'suspicious') {
+        // 疑似单源坏点（如 USDG 式聚合坏点）：拦截推送，记 history 备查，不建活跃事件
+        store.history.unshift({
+          key, symbol: leg.symbol, chain: leg.chain,
+          price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+          devBps: Math.round(devBps * 10) / 10, level,
+          confirmDevBps: leg.confirmDevBps === null || leg.confirmDevBps === undefined
+            ? null : Math.round(leg.confirmDevBps * 10) / 10,
+          confirmSrc: leg.confirmSrc || null,
+          firstSeen: nowIso, status: 'suspicious',
+          note: '双源复核未通过（副源正常/反向），疑似坏点，已拦截推送',
+        });
+        store.history = store.history.slice(0, 200);
+        console.log(`[depeg] ${key} 疑似坏点已拦截：主 ${devBps.toFixed(1)}bps / 副 ${
+          leg.confirmDevBps === null || leg.confirmDevBps === undefined ? '-' : leg.confirmDevBps.toFixed(1) + 'bps'
+        }（${leg.confirmSrc || '无副源'}）`);
+        continue;
+      }
+      // 2026-10-04 用户硬性要求：池子流动性 < $10,000 一律不报警（半夜尤其）；
+      // 叠加拦截低置信浅池 + 无第二池复核（USDD@Tron $16 池假严重教训）。
+      // 真脱锚会持续并被更深池/第二源确认，届时建事件再推；小池既做不了套利，也不配 Bark。
+      // 2026-10-28 扩围（用户立规"流动性不佳的池子不报"）：拦截门槛由 $10k 升至
+      // DEPEG_TRIGGER_MIN_LIQ_USD（$100k）——$10k–$100k 的薄池同样只观察不建事件，
+      // 价格照常上看板；真脱锚由该币深池腿触发，不靠薄池。
+      {
+        const liqUsd = leg.liq || 0;
+        const thinPool = liqUsd < DEPEG_TRIGGER_MIN_LIQ_USD;
+        const blocked = thinPool || (leg.lowConfidence && verdict === 'unconfirmed');
+        if (blocked) {
+          store.history.unshift({
+            key, symbol: leg.symbol, chain: leg.chain,
+            price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+            devBps: Math.round(devBps * 10) / 10, level,
+            confirmDevBps: null, confirmSrc: null,
+            firstSeen: nowIso, status: 'suspicious',
+            note: liqUsd < 10000
+              ? `池子流动性 $${Math.round(liqUsd)} < $10,000，不报警（用户硬性要求）`
+              : thinPool
+                ? `池子流动性 $${Math.round(liqUsd)} < $${DEPEG_TRIGGER_MIN_LIQ_USD.toLocaleString()} 触发门槛，只观察不报警（2026-10-28 用户立规：流动性不佳的池子不报）`
+                : '低置信浅池且无第二池复核，疑似坏点，已拦截推送；待确认后建事件',
+          });
+          store.history = store.history.slice(0, 200);
+          console.log(`[depeg] ${key} 已拦截不报：${devBps.toFixed(1)}bps liq=$${Math.round(liqUsd)}（${leg.dex || ''}）${liqUsd < 10000 ? '[流动性不足]' : thinPool ? '[薄池只观察]' : '[低置信未复核]'}`);
+          continue;
+        }
+      }
+      // 新事件
+      // 2026-10-04 用户硬性要求（半夜反复复核再发）：00:00–08:00 CST 只有
+      // severe + 池流动性 ≥ $10k + 第二池确认 才推送；其他一律记 history 压到天亮，
+      // 不建活跃事件（慢线也不处理），天亮后扫描重新评估。
+      if (isNightQuietHours() &&
+          !(level === 'severe' && (leg.liq || 0) >= 10000 && verdict === 'confirmed')) {
+        store.history.unshift({
+          key, symbol: leg.symbol, chain: leg.chain,
+          price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+          devBps: Math.round(devBps * 10) / 10, level,
+          confirmDevBps: leg.confirmDevBps === null || leg.confirmDevBps === undefined
+            ? null : Math.round(leg.confirmDevBps * 10) / 10,
+          confirmSrc: leg.confirmSrc || null,
+          firstSeen: nowIso, status: 'night-hold',
+          note: '半夜未达推送门（需 severe + 池≥$10k + 第二池确认），已压到天亮',
+        });
+        store.history = store.history.slice(0, 200);
+        console.log(`[depeg] ${key} 半夜压住不推：${devBps.toFixed(1)}bps liq=$${Math.round(leg.liq || 0)} confirm=${verdict}`);
+        continue;
+      }
+      // 2026-10-04 用户澄清：08:00–10:00 只有预警级压住（记 history，10 点后重评）；严重级照常建事件推送
+      if (isMorningQuietHours() && level !== 'severe') {
+        store.history.unshift({
+          key, symbol: leg.symbol, chain: leg.chain,
+          price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+          devBps: Math.round(devBps * 10) / 10, level,
+          confirmDevBps: leg.confirmDevBps === null || leg.confirmDevBps === undefined
+            ? null : Math.round(leg.confirmDevBps * 10) / 10,
+          confirmSrc: leg.confirmSrc || null,
+          firstSeen: nowIso, status: 'morning-hold',
+          note: '早上 08:00–10:00 预警级静默，不建事件不推送，10 点后重新评估',
+        });
+        store.history = store.history.slice(0, 200);
+        console.log(`[depeg] ${key} 早上静默压住不建事件：${devBps.toFixed(1)}bps`);
+        continue;
+      }
+      store.events[key] = {
+        key, symbol: leg.symbol, chain: leg.chain,
+        price: leg.price, liq: leg.liq, dex: leg.dex, pair: leg.pair, method: leg.method,
+        lowConfidence: Boolean(leg.lowConfidence),
+        // 池子失衡比先行指标（2026-10-03）：事件创建时的快照，供推送标注与慢线定性
+        poolImbalance: leg.poolImbalance ?? null,
+        imbalanceSig: leg.imbalanceSig ?? null,
+        confirm: verdict, // confirmed | likely | unconfirmed
+        confirmSrc: leg.confirmSrc || null,
+        devBps: Math.round(devBps * 10) / 10, level,
+        peakDevBps: Math.abs(Math.round(devBps * 10) / 10),
+        firstSeen: nowIso, lastSeen: nowIso,
+        lastPushAt: null, lastPushKind: null,
+        enriched: false, status: 'active',
+      };
+      const r = await pushDepegWithGrade(store, store.events[key], level,
+        `${level === 'severe' ? '🚨' : '⚠️'} ${leg.symbol}@${leg.chain} 脱锚${level === 'severe' ? '（严重）' : ''}`);
+      if (r.ok) {
+        store.events[key].lastPushAt = nowIso;
+        store.events[key].lastPushKind = level === 'severe' ? 'severe' : 'warn-new';
+      }
+      continue;
+    }
+
+    // 存续事件：更新 + 去重重报
+    const escalated = prev.level === 'warn' && level === 'severe';
+    prev.lastSeen = nowIso;
+    prev.price = leg.price;
+    prev.liq = leg.liq;
+    prev.devBps = Math.round(devBps * 10) / 10;
+    prev.peakDevBps = Math.max(prev.peakDevBps || 0, Math.abs(Math.round(devBps * 10) / 10));
+    if (escalated) prev.level = 'severe';
+    const sincePush = prev.lastPushAt ? now - new Date(prev.lastPushAt).getTime() : Infinity;
+    const repushMs = prev.level === 'severe' ? DEPEG_SEVERE_REPUSH_MS : DEPEG_WARN_REPUSH_MS;
+    // 2026-10-04：低置信浅池/流动性不足 + 无复核的存续事件也不重报（同新建拦截口径，用户硬性要求 liq<$10k 不报），只更新数据
+    // 2026-10-28 扩围：存续事件的主池跌破触发门槛（$100k）同样停推（同新建口径），
+    // 存量 USDD:Ethereum 事件（$49.5k 薄池）即时生效，不再按节律重报/升级推送。
+    const verdictNow = confirmDepeg(devBps, leg.confirmDevBps ?? null, DEPEG_WARN_BPS);
+    const weakNow = (leg.liq || 0) < DEPEG_TRIGGER_MIN_LIQ_USD || (leg.lowConfidence && verdictNow === 'unconfirmed')
+      || (leg.observeOnly && verdictNow !== 'confirmed'); // metric 只观察：存续事件也不许 metric 单源重报（2026-10-25）
+    // 2026-10-04 用户硬性要求：半夜重报也压住（同新建口径：severe + $10k + 确认 才推），不更新 lastPushAt，天亮后正常重报
+    const nightHoldRepush = isNightQuietHours() &&
+      !(prev.level === 'severe' && (leg.liq || 0) >= 10000 && verdictNow === 'confirmed');
+    if (weakNow) {
+      console.log(`[depeg] ${key} 存续但薄池/低置信未复核，跳过重报：${devBps.toFixed(1)}bps liq=$${Math.round(leg.liq || 0)}`);
+    } else if (nightHoldRepush) {
+      console.log(`[depeg] ${key} 半夜压住不重报：${devBps.toFixed(1)}bps liq=$${Math.round(leg.liq || 0)} confirm=${verdictNow}`);
+    } else if (escalated || sincePush >= repushMs) {
+      const r = await pushDepegWithGrade(store, prev, prev.level,
+        `${prev.level === 'severe' ? '🚨' : '⚠️'} ${leg.symbol}@${leg.chain} 脱锚${escalated ? '升级为严重' : '持续中'}`);
+      if (r.ok) {
+        prev.lastPushAt = nowIso;
+        prev.lastPushKind = escalated ? 'escalated' : 'repush';
+      }
+    }
+  }
+
+  saveDepegEvents(store);
+
+  // 交易所逐所盯跌层（cex_dip_watch.mjs，2026-10-28 方案 v3）已于当晚与本扫描
+  // 解耦：由 startCexDipPoller 在进程内自轮询（薄池/单源 10s、深池 30s，见启动
+  // 处），锚腿取本扫描最近一轮的 lastDepegLegs；其状态摘要由轮询回调维护到
+  // depegMonitorState.cexDip。此处不再同轮调用，避免 5 分钟节奏拖慢盯跌层。
+
+  depegMonitorState.lastScanAt = nowIso;
+  depegMonitorState.lastError = null;
+  depegMonitorState.activeCount = Object.keys(store.events).length;
+  console.log(`[depeg] 扫描完成：${legs.length} 条链价，活跃事件 ${depegMonitorState.activeCount}`);
+}
+
+app.use(express.json());
+
+app.get('/api/health', (_request, response) => {
+  response.json({ ok: true, now: new Date().toISOString() });
+});
+
+app.get('/api/notifications', (_request, response) => {
+  response.json({
+    updatedAt: new Date().toISOString(),
+    config: a0NotificationConfig(),
+    state: notificationState,
+  });
+});
+
+app.get('/api/stablecoins', async (_request, response) => {
+  try {
+    response.json(await getStablecoins());
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/chains', async (_request, response) => {
+  try {
+    const chains = await getLifiChains();
+    response.json({
+      source: 'LI.FI Chains',
+      chains: chains
+        .filter((chain) => CORE_CHAIN_IDS.includes(chain.id))
+        .map((chain) => ({
+          id: chain.id,
+          name: chain.name,
+          key: chain.key,
+          coin: chain.coin,
+        })),
+    });
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/chain-spreads', async (_request, response) => {
+  try {
+    response.json(await getStablecoinChainSpreads());
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/exchange-prices', async (_request, response) => {
+  try {
+    response.json(await getExchangePrices());
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/depeg-monitor', async (_request, response) => {
+  try {
+    const store = loadDepegEvents();
+    response.json({
+      updatedAt: new Date().toISOString(),
+      enabled: DEPEG_MONITOR_ENABLED,
+      state: depegMonitorState,
+      thresholds: {
+        warnBps: DEPEG_WARN_BPS,
+        severeBps: DEPEG_SEVERE_BPS,
+        clearBps: DEPEG_CLEAR_BPS,
+        scanIntervalMs: DEPEG_SCAN_INTERVAL_MS,
+      },
+      active: Object.values(store.events),
+      history: store.history.slice(0, 50),
+    });
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/routes', async (request, response) => {
+  try {
+    response.json(await getRoutes(request.query));
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/yield-assets', async (_request, response) => {
+  try {
+    response.json(await getYieldAssets());
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/redemption-spreads', async (_request, response) => {
+  try {
+    response.json(await getRedemptionSpreads());
+  } catch (error) {
+    response.status(502).json({ error: error.message });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Stablecoin risk desk API listening on http://localhost:${port}`);
+  if (port === 8787 || process.env.A0_NOTIFY_ON_ANY_PORT === '1') {
+    scanA0Notifications().catch((error) => {
+      notificationState.lastError = error.message;
+    });
+    setInterval(() => {
+      scanA0Notifications().catch((error) => {
+        notificationState.lastError = error.message;
+      });
+    }, A0_NOTIFICATION_INTERVAL_MS);
+    if (DEPEG_MONITOR_ENABLED) {
+      console.log(`[depeg] 脱锚监控已启动，每 ${DEPEG_SCAN_INTERVAL_MS / 1000}s 扫一轮`);
+      scanDepegMonitor().catch((error) => {
+        depegMonitorState.lastError = error.message;
+      });
+      setInterval(() => {
+        scanDepegMonitor().catch((error) => {
+          depegMonitorState.lastError = error.message;
+        });
+      }, DEPEG_SCAN_INTERVAL_MS);
+      // 2026-10-28 方案 v3 加密（用户拍板「5 分钟长了点」）：逐所盯跌层自轮询，
+      // 与上面的 5 分钟主扫描解耦——薄池/单源币 10 秒、深池币 30 秒，只拉
+      // ticker，盘口仍只在破线时拉。进程内定时器（防重叠 + 单所失败退避），
+      // 随 server.js 启停，不新增进程/cron。开关：CEX_DIP_WATCH_ENABLED=0 关闭。
+      if (process.env.CEX_DIP_WATCH_ENABLED !== '0') {
+        startCexDipPoller(
+          () => ({ legs: lastDepegLegs, sendPushplus, sendBark }),
+          {
+            onSummary: (_tier, summary) => {
+              depegMonitorState.cexDip = { ...summary, at: new Date().toISOString() };
+            },
+          },
+        );
+      }
+    }
+  }
+});

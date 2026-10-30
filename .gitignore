@@ -27,3 +27,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# 运行时状态与缓存（2026-10-30 入库整理）
+state/
+.bt/
+sweep_loop.pid
+sweep_loop.heartbeat

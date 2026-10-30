@@ -1,0 +1,836 @@
+{
+ "hacker": "0x8d53903625b8e839b9df4bd28b0efb1cd6b8639a",
+ "seed": [
+  {
+   "address": "0x0cdd9cbb825212c6cc5b0b36239e94218ee661d8",
+   "totalBorrowedEth": 11701,
+   "borrowCount": 18,
+   "totalRepaidEth": 11701.0334,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 36868428,
+   "firstBorrowBlock": 26300889,
+   "lastBorrowBlock": 26301105,
+   "borrowTxs": [
+    "0xcb39901f2228cef793728c4b53b68793705f8eca38618981ac88bf4003fb4aa6",
+    "0x0673e2c404cfccfd1bd4827cc6cdcf931f439885617e63e3c74acbba9df86131",
+    "0x803d3cf7a25c2a0c8e7225f55e550a726eb78b412765e2375c3c979847d46399",
+    "0x5c11cbfdbd99f4dd7adc263cce76ed6d458e8ab76ededb095ec6e73be1d128ba",
+    "0x3a73559e3fd5a478ea3a08c0df9e19e1232c3c9725a4363d424f88fce1e48565",
+    "0xd0eab3d458f06436e7e538ad6975f390b634840b5a1e91213476559489306820",
+    "0x53d47a2fb778de0074b3d83659ebcc52cf96c2cf8a95369ad35493b15c371bde",
+    "0xa31f1f7ac2f75c8751ea138c0f4439dffbff1f2234c49535d393c89190eed64a",
+    "0x3eff7efbaefee58a01023f62fcd55251a408fa0e241da286788f2ddbd719b2ed",
+    "0x39b892d0d7358da0a66c02a9f78ed3557bf7f4c3fe23c6c378f0ec33f04cb5f5",
+    "0xa2ee9c37692798b0c357cc3bb49e674ad434e6815fd3fad598ae7237d945809b",
+    "0x5c0552c6303a7c9e4abf9984f5bd645071fa8d55bfc44edcef9b51d1f8931fe2",
+    "0x0f026222cc97c15a1ffcabce0c8ebf9c1829f4dcdbf3b6803ffa141d238fa1f0",
+    "0x1c5e540710d0fcdf68b784d7eb85870ff35b280e6f2255ff2b220e343d97ca7b",
+    "0x1812d51b11db494dd7ce2efe2feecf987c429778bbef9e55da679ce81714c7bd",
+    "0x812fbd55c6a5cbde6c262844eeb716325af8690356117228d85e55b13c690a2d",
+    "0x78c5efb6312f06eb69d967699af7111790a9ec13cb44f7f5639532d643144b6a",
+    "0xb4c760a7c686132316db6601b30e209a82aaa02a22106f19a4cae18796f9bf01"
+   ]
+  },
+  {
+   "address": "0x9600a48ed0f931d0c422d574e3275a90d8b22745",
+   "totalBorrowedEth": 7339.4925,
+   "borrowCount": 2,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301146,
+   "lastBorrowBlock": 26301160,
+   "borrowTxs": [
+    "0x9d61f06fb3b174cededf6c713e7e91b2b2e9ca5b70cdd29686103b21084762b1",
+    "0xc718c5b6741cd342d033211dbe514fb9d1969f13c07cd8ed0bede1b2a61ecae2"
+   ]
+  },
+  {
+   "address": "0x303d0a175ceec14dd7b3d4f60cabe6cec06a3d9f",
+   "totalBorrowedEth": 5000,
+   "borrowCount": 1,
+   "totalRepaidEth": 5000,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 16790500,
+   "firstBorrowBlock": 26301129,
+   "lastBorrowBlock": 26301129,
+   "borrowTxs": [
+    "0xbf059c980732e3b75a54df8acd3b21b0350c1d45e3fa137bebba0d64f0aa5ece"
+   ]
+  },
+  {
+   "address": "0x1be45fef92c4e2538fecd150757ed62b7b3757d7",
+   "totalBorrowedEth": 2000,
+   "borrowCount": 1,
+   "totalRepaidEth": 1999,
+   "repaidFull": false,
+   "suppliedUsdt": 8015365,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301084,
+   "lastBorrowBlock": 26301084,
+   "borrowTxs": [
+    "0xecd12dacecf6effe24928ff9f0d12a3c4b0ce5366767420b4f50d362f3dec2bf"
+   ]
+  },
+  {
+   "address": "0xc7555293af17aca821e1f0fc3e5d3112a85d3ebe",
+   "totalBorrowedEth": 1800,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 6673479,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301110,
+   "lastBorrowBlock": 26301110,
+   "borrowTxs": [
+    "0x842631adb8d93997b531c75862b31182a0d5e9cbafdb8431810c550dc45cbba8"
+   ]
+  },
+  {
+   "address": "0xcaab6ff98989fdd4f47e7db6152e6fb47994ec1e",
+   "totalBorrowedEth": 1565,
+   "borrowCount": 4,
+   "totalRepaidEth": 1565.0085,
+   "repaidFull": true,
+   "suppliedUsdt": 4540401,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26300981,
+   "lastBorrowBlock": 26301058,
+   "borrowTxs": [
+    "0x615fa29eb4b1904486c0a3cec334c1987851ce6adf15cf70b0153005753d21ed",
+    "0xf659a8204f5db72d68aa5b026207f403201d7ba698e656d53b3a132aa9e88365",
+    "0x47add45f959908cc7c443809b1ee869bd9caa6e970ff4ecd6d10d743de8c040a",
+    "0xecf72f6fe4ab9367726c3aa730b26676f4bff3ef149c553c2ea8f89f89df43eb"
+   ]
+  },
+  {
+   "address": "0xdca6d9de6cba400d497d8fe86fe2832066d9e39a",
+   "totalBorrowedEth": 1500,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301065,
+   "lastBorrowBlock": 26301065,
+   "borrowTxs": [
+    "0x6b89d69e1ebca066f89b435a3062f8281be21e68a53dddd10e0fdbd9876d252c"
+   ]
+  },
+  {
+   "address": "0x2b41a0850394d716ddd6b0e200c5d43be5bce8fa",
+   "totalBorrowedEth": 1100,
+   "borrowCount": 2,
+   "totalRepaidEth": 495,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 4151649,
+   "firstBorrowBlock": 26301101,
+   "lastBorrowBlock": 26301125,
+   "borrowTxs": [
+    "0xb6b612ade32eccbb96b7ebbc35f68dfb86679eabbe747f2cc7b02caa867f6b4a",
+    "0xe79afe751af7ab1f0ff147d289e31bd7bc1c22d81865db36f870dfe3019e3a01"
+   ]
+  },
+  {
+   "address": "0x76f30e3f75437fb862b8d2c4d80a671bceba5b1a",
+   "totalBorrowedEth": 1087.5276,
+   "borrowCount": 1,
+   "totalRepaidEth": 1087.5276,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301019,
+   "lastBorrowBlock": 26301019,
+   "borrowTxs": [
+    "0x4c434fc325793fd1d1602df5a65980d8826de370ff7c6c6965a48582d64f25c2"
+   ]
+  },
+  {
+   "address": "0xfa653acca123c3d4af1f5f24daf8cf57de963beb",
+   "totalBorrowedEth": 1066.6793,
+   "borrowCount": 4,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 3214655,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26300994,
+   "lastBorrowBlock": 26300997,
+   "borrowTxs": [
+    "0xd9193051f411843b65304fd98bcf17fd023fe5be5b215405b0415f41a74df2ac",
+    "0x6d9311e79f016f776ff050e41157d1fab82fda771557305aabe93d40f1b9412a",
+    "0xacdd590ea6ccfa35bbbfc82cf4be3ee06d01cd246199f132ec3db7cfefebd823",
+    "0x10718a597813231c15708a9abbf0a6f9599cdb2ff2300bf11ee1f8979cfe9acf"
+   ]
+  },
+  {
+   "address": "0x9c5b0eb419e52d5d229d01898190a05c357cad08",
+   "totalBorrowedEth": 1030,
+   "borrowCount": 7,
+   "totalRepaidEth": 1030.0076,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 4649975,
+   "firstBorrowBlock": 26301059,
+   "lastBorrowBlock": 26301133,
+   "borrowTxs": [
+    "0x14253fb806f4a54482dc274b8f3980fb8b45717d2a7a5fcba78f564106994328",
+    "0x3fdb4f06ed8533d7de9676242fceff65665117974bb1e5e287b749bfa48d7d49",
+    "0xb3770c7935ba02b5820a28888bb4a318eca5c4cdcbbe9e0a013aa70c8426cf89",
+    "0x8d7d126e74204d74df1911363b55eba6e83f2ff5c5928c12ef6b8248bfa1385e",
+    "0xb3c71d69eb88282947b226d9a8668b804b21de5d80aabbe192cded2f3abd01d0",
+    "0x6c4331801f69a05f08927bd5d666a97dcba2bbcfee3b6a3e94fca9fd58da12d9",
+    "0x7aed2e57ab3960642bde18ce359429267aaffb8050cc83523762cfa67ab6c5fe"
+   ]
+  },
+  {
+   "address": "0xcd40532686b94abc88b06b9705aacbc14c8364d6",
+   "totalBorrowedEth": 1000,
+   "borrowCount": 5,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 2103982,
+   "suppliedUsdc": 2800855,
+   "firstBorrowBlock": 26300972,
+   "lastBorrowBlock": 26301122,
+   "borrowTxs": [
+    "0x9dccb2f7bf5c01d420f9a3c5deb603e1b51682e1e77721cd5796ff45426dcca9",
+    "0x522ac3b1f5d7b1cf033a26917221ab98761b2e615799bcd4592e3334f4a9e9e6",
+    "0x2265cba17bee27e3c5b3fee04e690c6afe5692b906b443cc9a22c65dd17593db",
+    "0xee223a97120d3faa6a247110deb0dfc4c5e8b8f5ed453298ad3f64faff29590c",
+    "0x66f6f6129f88c4e5781f609f32ad50dc8df86e1e0c3d03388c28f4f3f3428757"
+   ]
+  },
+  {
+   "address": "0x839f654749f493f5407bde26556e5052376f144e",
+   "totalBorrowedEth": 1000,
+   "borrowCount": 1,
+   "totalRepaidEth": 1000.0006,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301079,
+   "lastBorrowBlock": 26301079,
+   "borrowTxs": [
+    "0xa76b47325b11246b72d2a53393ef1db09e7f86a850b70c084cc4ab1cd3af5e13"
+   ]
+  },
+  {
+   "address": "0x47a761bb9e970ac93cb571c4614c4ca643714e4f",
+   "totalBorrowedEth": 1000,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 5000000,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301135,
+   "lastBorrowBlock": 26301135,
+   "borrowTxs": [
+    "0x51cb6070daede95c61b323420d3f2359276750981354e199d346fbdba1ba698a"
+   ]
+  },
+  {
+   "address": "0xa3a1443a166fe8501973a8233aa13f766e682f7d",
+   "totalBorrowedEth": 610,
+   "borrowCount": 2,
+   "totalRepaidEth": 310,
+   "repaidFull": false,
+   "suppliedUsdt": 3025945,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301096,
+   "lastBorrowBlock": 26301104,
+   "borrowTxs": [
+    "0x46553132f9df6a36b22e647ddaa114fb59276980426f7761d9e7306f94415df5",
+    "0xf23bdd400b119dff918c36e5212bec699d00b44db05dfa969bce019d50ee5318"
+   ]
+  },
+  {
+   "address": "0x41f6a54a627d31d7744cdf4a470cb3a32d6cb114",
+   "totalBorrowedEth": 510,
+   "borrowCount": 6,
+   "totalRepaidEth": 510.0024,
+   "repaidFull": true,
+   "suppliedUsdt": 1764286,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26300944,
+   "lastBorrowBlock": 26301063,
+   "borrowTxs": [
+    "0x4789ddd2456736b076d47d1d66eddb38288c37c009ec79aa6f923ce06bf1b887",
+    "0x9bbf1c9a6b68035f0ad50038d787cb3958aadf31185cf712aac172399d75f798",
+    "0x679cafd145db83be27d997e81d82242ca86c1c6ed228544057f5157dbd6497f1",
+    "0x82defb2d6c55a94989ea42b62290ae2c4986e027421c6e1ab2eef8f4fb337506",
+    "0x0d29c063b92db4db41b092d987a98964fbf86ae2726cd8ab6f26de4f7fa43c29",
+    "0x131a183e162e84fcbd37aaaa4c1889038318c2642714692d0c88dc8f3a006f5a"
+   ]
+  },
+  {
+   "address": "0x14d239adc0d429a4417db252eb1aad86c9500a3e",
+   "totalBorrowedEth": 500,
+   "borrowCount": 1,
+   "totalRepaidEth": 500.0006,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301119,
+   "lastBorrowBlock": 26301119,
+   "borrowTxs": [
+    "0x8f3b33f3a4bc0d003bbf93e13e2ab395d9d345cffed7bad4c08992d63b1e91d2"
+   ]
+  },
+  {
+   "address": "0x8986f93988d415abfb7b9bb700ccd3580c2f5298",
+   "totalBorrowedEth": 400,
+   "borrowCount": 1,
+   "totalRepaidEth": 400,
+   "repaidFull": true,
+   "suppliedUsdt": 6085247,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301103,
+   "lastBorrowBlock": 26301103,
+   "borrowTxs": [
+    "0x707200a48a01631fab9daeaae8b716b3c71b93062bfb0923ce82a18b9e05f0a0"
+   ]
+  },
+  {
+   "address": "0xf5dc3af6d78957b1877622335770e6b49459a5d2",
+   "totalBorrowedEth": 313,
+   "borrowCount": 6,
+   "totalRepaidEth": 313.0025,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 1085822,
+   "firstBorrowBlock": 26301027,
+   "lastBorrowBlock": 26301135,
+   "borrowTxs": [
+    "0xb91231cc208e527a896f09439d70342574a1e3ddf5706de55d8df8e286cdfbb8",
+    "0x4d5c68a529192235ec93433e2cc67a98eb84023a383294099775389a0f7254f8",
+    "0xf0969c90fb214c82560608193135c18110f9366d5c876c0060c3cc6b65e32dd4",
+    "0x90630681f4c5da151123ef4abd068b0a404b8589c7222ecd30e8c529861b42df",
+    "0xd3d07869db12059a6ad36e91e093bea9b44a282c14d65e1ced9cd5ac9fdad2ae",
+    "0x3c624322ecdadfe738b0f630d50a0b6a2f9dd9092080455657d1f34cf6d2c688"
+   ]
+  },
+  {
+   "address": "0xf292bed4bff2a3d1fd9ab4217ed4d29efaf1d797",
+   "totalBorrowedEth": 240,
+   "borrowCount": 3,
+   "totalRepaidEth": 240.0002,
+   "repaidFull": true,
+   "suppliedUsdt": 500000,
+   "suppliedUsdc": 300000,
+   "firstBorrowBlock": 26301092,
+   "lastBorrowBlock": 26301122,
+   "borrowTxs": [
+    "0x7ac86d4a3850c3c8fe7972b43dce41aea48303e01145511f6a27e5a2c60ecccc",
+    "0x960dd17edeeb319b2d824a85c5b5aff0a66b1ec43aee95be1c43df13b49d1589",
+    "0xbb67a4cda5ba38368637a2a99af43d81fde1e977bcc6812e7f9a8f8ce42d6024"
+   ]
+  },
+  {
+   "address": "0x3b15cec2d922ab0ef74688bcc1056461049f89cb",
+   "totalBorrowedEth": 225,
+   "borrowCount": 4,
+   "totalRepaidEth": 225.0004,
+   "repaidFull": true,
+   "suppliedUsdt": 507302,
+   "suppliedUsdc": 298408,
+   "firstBorrowBlock": 26300982,
+   "lastBorrowBlock": 26301126,
+   "borrowTxs": [
+    "0x096f8c2ff14edcd3a3422cf77caf3e2d43de65e9508f32fadcebabba678d3cd1",
+    "0xb3e06e872079ed319a5d205a7f0c3fd5e97a59fdc328c5d38b47ff2710062256",
+    "0xe9c03ff21910e3069cd5f78f472545028779b8d6730dc9deec17b02cadcedf69",
+    "0x9f94e7bc22c41d969997abcf9f207f854853f9391a5eb29a6804e2f5d91a490e"
+   ]
+  },
+  {
+   "address": "0x50f02612ea1f79a84ef72d6912a5452f40a88edd",
+   "totalBorrowedEth": 210.5524,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 633993,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26300996,
+   "lastBorrowBlock": 26300996,
+   "borrowTxs": [
+    "0xc9a891d8ffa6a019e157a99f4eb14b25e47615dc71b1c35d14ee1e84a2a63e14"
+   ]
+  },
+  {
+   "address": "0x9f9e03d1137e1b1afd2599f917016621a9da0aa3",
+   "totalBorrowedEth": 190,
+   "borrowCount": 4,
+   "totalRepaidEth": 190.0002,
+   "repaidFull": true,
+   "suppliedUsdt": 751181,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301054,
+   "lastBorrowBlock": 26301090,
+   "borrowTxs": [
+    "0xa0cef88e1046fd182fb5e6b3950930995aab320ee0a581a928f05442de76577d",
+    "0xcc8e200ca500d105e36df73d8f6617bf0483a8323a45ed182b13316a14aa924d",
+    "0x73519a897f7e2d68d7fdea3232a18ff9491ba5ad5b1f2bb219446982164e0356",
+    "0xa4096a118dfb40a9bddbf7e26eb89b2c3dc3b0d1ba8e3e721785422ff2734fcb"
+   ]
+  },
+  {
+   "address": "0x60753e8622a6cfea1df449a9625a9778bb922b72",
+   "totalBorrowedEth": 161.659,
+   "borrowCount": 2,
+   "totalRepaidEth": 163.689,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 382098,
+   "firstBorrowBlock": 26300989,
+   "lastBorrowBlock": 26301114,
+   "borrowTxs": [
+    "0x914b941c5672cce600f37b455f8a2bebb5200370030306940aa691b2ad588a35",
+    "0xcde4f19fd6268386afd3daac2ac1c9623d225f609f17d000dd7f0edf7d43b231"
+   ]
+  },
+  {
+   "address": "0x7d5b8b1863f2e9c5c9b39ce9685d82db2bec5192",
+   "totalBorrowedEth": 150,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 584168,
+   "firstBorrowBlock": 26301089,
+   "lastBorrowBlock": 26301089,
+   "borrowTxs": [
+    "0x0485ad285d11d5f44a00a4f56fc5cb88b4c6c2d8a7bc9ddf852e15370aee4f33"
+   ]
+  },
+  {
+   "address": "0x50bfdaca63635abd3dccb634136dd017e2aab979",
+   "totalBorrowedEth": 145.2067,
+   "borrowCount": 5,
+   "totalRepaidEth": 145.2072,
+   "repaidFull": true,
+   "suppliedUsdt": 440183,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301009,
+   "lastBorrowBlock": 26301086,
+   "borrowTxs": [
+    "0x4693184f593978da6c547a8e737f9c500f70cbda949d46ea1c26aa38762f9895",
+    "0xeee4acbeb7ed5221f20090766f48f8492abdfd3727a20b2aa289476bbb568d20",
+    "0x339eb8a88f0cfee2be104ee7ef127b3319c5b8c0bd878ba306ee9d7a2172bb63",
+    "0x61f45e4cbf8ec3ecfeefb26ea4310cbc243030d587ca9e2c61dc65967f0aa85b",
+    "0xe93c714cf3a4f31d3c5217d2812fecbac6f966c3cfa9a44d2b5dd4f557dc7116"
+   ]
+  },
+  {
+   "address": "0x4b4704ed5956224c009dd3423cd42cf1efd22d0e",
+   "totalBorrowedEth": 141,
+   "borrowCount": 6,
+   "totalRepaidEth": 141.0003,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 446947,
+   "firstBorrowBlock": 26301029,
+   "lastBorrowBlock": 26301125,
+   "borrowTxs": [
+    "0x18859e1575ee16acfa72c106f5c4921ff702712d204ae0b00875bb46cd55c230",
+    "0x717bc37a8dae93ef845403b273465ee913cac35cb615d5785976fb50d9bfcd70",
+    "0x68b20c467f981abfe43be59fa1c0be0d09ff5f62fa8d96648b414784e172f984",
+    "0xf3dc40d8949dbed8c36fcf36f331d2637faf0d7fc008d9b5e0301f157e29a3cd",
+    "0x1983644e8bfd48e3199038ee8fea68273be5670076c2b86df9efbd4d484b7d56",
+    "0x69bf2306cd172222430345706d7a5c1a3597662f13b5137129dac9e3a269f897"
+   ]
+  },
+  {
+   "address": "0x3f51ad2d5ff5b2fc5ace0da7002dc364a3001e32",
+   "totalBorrowedEth": 135,
+   "borrowCount": 3,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 312025,
+   "firstBorrowBlock": 26301061,
+   "lastBorrowBlock": 26301114,
+   "borrowTxs": [
+    "0xd370a2534b723f1e38d5946460eea8d6f4937f0cbbd582744598abc5874ac36c",
+    "0x7c70a683efbac528bf434e0bc240a280a6feb23a8678b7ed899cd838ce1c4e61",
+    "0x93ed982cdc3d7b615ffc1b02ec1f9f3f72cadf6405e6cb6fc54c45207d690f70"
+   ]
+  },
+  {
+   "address": "0x0a5a553be537672aed63f29c2ac7898e60836b70",
+   "totalBorrowedEth": 119.9924,
+   "borrowCount": 4,
+   "totalRepaidEth": 119.9927,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 449680,
+   "firstBorrowBlock": 26301084,
+   "lastBorrowBlock": 26301122,
+   "borrowTxs": [
+    "0x9f6e42082e2e497236a76583bcb766b72187d4a490ab2ff218aa5e27db453354",
+    "0x3f4176dae17d40594f4610920cc0746e529f81dcb8000c0542e3f682662ba388",
+    "0x81e3c8d90c9eda406a81870050dad467825dfd1484f4dc5681968ca71e81d5e3",
+    "0x4e0cf2770438ddffb7f0f1c883d0ff28fe7023079e00db32bb03330bdf4b0f4c"
+   ]
+  },
+  {
+   "address": "0x00c4168dd6736e9850f50af8f3b6b5c113107e1a",
+   "totalBorrowedEth": 100,
+   "borrowCount": 1,
+   "totalRepaidEth": 100.0001,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301056,
+   "lastBorrowBlock": 26301056,
+   "borrowTxs": [
+    "0xe3be80abb304d2e18c783bd34221e2a3413494a7439d86ac799ee8e353a1331b"
+   ]
+  },
+  {
+   "address": "0x1b00f2c63341bbba8c4ee74c473039a1bcf083bf",
+   "totalBorrowedEth": 100,
+   "borrowCount": 1,
+   "totalRepaidEth": 100.0004,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301096,
+   "lastBorrowBlock": 26301096,
+   "borrowTxs": [
+    "0x27fa47b0b432577415f1112a62fc5300fba023dd950305a71c7514ad4d84f196"
+   ]
+  },
+  {
+   "address": "0x732fe63200dd4a5eba02ffa11f150a4c81b01e84",
+   "totalBorrowedEth": 50,
+   "borrowCount": 2,
+   "totalRepaidEth": 50.0001,
+   "repaidFull": true,
+   "suppliedUsdt": 208757,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301057,
+   "lastBorrowBlock": 26301087,
+   "borrowTxs": [
+    "0x733ab7cd4fbf124a289854a4b33090a4ee30b42647b1d904c268f4fc0e7730d4",
+    "0xf14c7ba56e7eda55c890c85478ae9b2ca66a17ca244923089b57475db124ff15"
+   ]
+  },
+  {
+   "address": "0x555ce236c0220695b68341bc48c68d52210cc35b",
+   "totalBorrowedEth": 50,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 300000,
+   "firstBorrowBlock": 26301135,
+   "lastBorrowBlock": 26301135,
+   "borrowTxs": [
+    "0xf2d164ac576bcbadb5c3bab4d631dd927f380e154f2d4abbfcb88fc8294cf2af"
+   ]
+  },
+  {
+   "address": "0xa8dbcdb0290000c810c72fc00018f600b0272d87",
+   "totalBorrowedEth": 40,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 204696,
+   "firstBorrowBlock": 26301105,
+   "lastBorrowBlock": 26301105,
+   "borrowTxs": [
+    "0x1a94c3beba75011a9c6dfe331a2bce9c462e0813600d03342a2a2ff6f344f453"
+   ]
+  },
+  {
+   "address": "0x36d217a33e1a33ee83faf9270bf7298792699108",
+   "totalBorrowedEth": 40,
+   "borrowCount": 1,
+   "totalRepaidEth": 40,
+   "repaidFull": true,
+   "suppliedUsdt": 161467,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301111,
+   "lastBorrowBlock": 26301111,
+   "borrowTxs": [
+    "0xc70fb2cb7f2c8c86870821d39d5718d93220383c6e3f13912d6d8cb42796cb35"
+   ]
+  },
+  {
+   "address": "0x37563d2bff39266dd231a3e7069f95e20033d02a",
+   "totalBorrowedEth": 32,
+   "borrowCount": 2,
+   "totalRepaidEth": 32,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 99938,
+   "firstBorrowBlock": 26301083,
+   "lastBorrowBlock": 26301113,
+   "borrowTxs": [
+    "0x2159553d451000386d77e833839b2f84953131890c70120005af12d57df7866e",
+    "0x00c2d10e6f613f72c7f21617b7c57a5035cd2feff6d6f91840f7cf56868cf689"
+   ]
+  },
+  {
+   "address": "0x1a0fa489c3e09bc435e93a3e28ebe84a996e598c",
+   "totalBorrowedEth": 30,
+   "borrowCount": 1,
+   "totalRepaidEth": 30.0001,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301102,
+   "lastBorrowBlock": 26301102,
+   "borrowTxs": [
+    "0xb08a6d554caf4dba34af6bb552435f8ea2e22cedf46b8cb0646c1bb346b55c59"
+   ]
+  },
+  {
+   "address": "0x2752356b88c05d52a1a7ebb2ddd1b93f5b423a22",
+   "totalBorrowedEth": 25,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 221185,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301077,
+   "lastBorrowBlock": 26301077,
+   "borrowTxs": [
+    "0x1c2299a2fcbfe0b9e189f14575fae472d26aa5eceee45550b833f3d0b8fa67a1"
+   ]
+  },
+  {
+   "address": "0x120680a60f98eae167f8a17667e877935fa2db90",
+   "totalBorrowedEth": 21,
+   "borrowCount": 2,
+   "totalRepaidEth": 21,
+   "repaidFull": true,
+   "suppliedUsdt": 159466,
+   "suppliedUsdc": 153785,
+   "firstBorrowBlock": 26300976,
+   "lastBorrowBlock": 26301178,
+   "borrowTxs": [
+    "0x303d0c8b385c8ca59402e58fb321a2be007b69ff825b55f0e9bc7388138d98e6",
+    "0x171ba9dc4c8c71d968b8d8d75a6691ce2f1b7bb2bb16c52aa8d187434f335d2f"
+   ]
+  },
+  {
+   "address": "0x299188475f29ef2984e020cba55ec02c522a9087",
+   "totalBorrowedEth": 20,
+   "borrowCount": 2,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 54854,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26300915,
+   "lastBorrowBlock": 26300962,
+   "borrowTxs": [
+    "0x65ec6cafb84147390ec2cd1ff9beb408a49a438c84ea3ff15175241c2cab4204",
+    "0xc590bffd3a6bf844af87f58ab461fc12e2bcb9096f1007cdfc78936038b01141"
+   ]
+  },
+  {
+   "address": "0x9e1fdc4ed12d7cb16d30542254781eb7d0f3290c",
+   "totalBorrowedEth": 20,
+   "borrowCount": 1,
+   "totalRepaidEth": 20.0001,
+   "repaidFull": true,
+   "suppliedUsdt": 100000,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301112,
+   "lastBorrowBlock": 26301112,
+   "borrowTxs": [
+    "0x25e8b17c6c6868414116b2c5904a10803ffaae21d80d451a1a62c55a29ea7b70"
+   ]
+  },
+  {
+   "address": "0x23e69bf1ada63b7ef0d7f453fa64c61a257b72f1",
+   "totalBorrowedEth": 13,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 57144,
+   "firstBorrowBlock": 26301081,
+   "lastBorrowBlock": 26301081,
+   "borrowTxs": [
+    "0x3c52d7e24b7b5705e7c69a5b90bf7b92e7b5441696255ef0972ddea9eca7b3dc"
+   ]
+  },
+  {
+   "address": "0xfd118e680b86df260ef630cdd56b9e4a97aa3a30",
+   "totalBorrowedEth": 11,
+   "borrowCount": 4,
+   "totalRepaidEth": 11,
+   "repaidFull": true,
+   "suppliedUsdt": 38476,
+   "suppliedUsdc": 13007,
+   "firstBorrowBlock": 26300953,
+   "lastBorrowBlock": 26301060,
+   "borrowTxs": [
+    "0xdf42e2e99defff19d687feb0a829e40fa880f7dedbaf2896e7b6731c6e4827c5",
+    "0x3e76ce1e653b6511286503f83493014d67ec10413611f9eea0a2764fe2cc04c6",
+    "0xa7d427b48c5058680d1db26ddfaf9115437728a6c9e4e778614798d19fc33d1b",
+    "0x065c3da1266ca985e89e4c4af5f3d1846315ea84d155f8101452827bfdac27df"
+   ]
+  },
+  {
+   "address": "0x84529b584a6b959fc3288b070cf6996b3fc78ec6",
+   "totalBorrowedEth": 9.747,
+   "borrowCount": 1,
+   "totalRepaidEth": 9.7471,
+   "repaidFull": true,
+   "suppliedUsdt": 30000,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301079,
+   "lastBorrowBlock": 26301079,
+   "borrowTxs": [
+    "0x5a8ac4e385e8d8cd7b73789a290bf3fcec110164f5278c9de5ab931ed68be957"
+   ]
+  },
+  {
+   "address": "0x304856144a8cc390cd59c76f7df2dcd8174ba549",
+   "totalBorrowedEth": 9,
+   "borrowCount": 1,
+   "totalRepaidEth": 9.0001,
+   "repaidFull": true,
+   "suppliedUsdt": 30280,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301092,
+   "lastBorrowBlock": 26301092,
+   "borrowTxs": [
+    "0xfaa3d1dcfd0ed6a3f854c7fde72db077854b1f92b4a6a79f7bbd26bca51fa6bc"
+   ]
+  },
+  {
+   "address": "0x2fae625f0013632f474b4e093aa74311cfedd2eb",
+   "totalBorrowedEth": 7.8,
+   "borrowCount": 1,
+   "totalRepaidEth": 7.8001,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 24034,
+   "firstBorrowBlock": 26301064,
+   "lastBorrowBlock": 26301064,
+   "borrowTxs": [
+    "0x599719d8b5f91ed61b483197342c82cb9f1475bbe822cb9310f1502fad7e8855"
+   ]
+  },
+  {
+   "address": "0x739afbe91d4ba8e8a78f9206f577ba2ba16ef63a",
+   "totalBorrowedEth": 5,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301028,
+   "lastBorrowBlock": 26301028,
+   "borrowTxs": [
+    "0x4acc06d07328daffb776455d16a0550fe8494e47b7e0e60d9a99e7015e482c8d"
+   ]
+  },
+  {
+   "address": "0xa4c39bc895e380e0b54f9b1c952c3bc151cf6fb2",
+   "totalBorrowedEth": 5,
+   "borrowCount": 1,
+   "totalRepaidEth": 5,
+   "repaidFull": true,
+   "suppliedUsdt": 10833092,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301039,
+   "lastBorrowBlock": 26301039,
+   "borrowTxs": [
+    "0xc3f5bd3ed02c110a9f55522c9f4d91db4e359defde6be5a964fb59401576a370"
+   ]
+  },
+  {
+   "address": "0xded301f64a5807234f4db446d0e2372523fca2ba",
+   "totalBorrowedEth": 3,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26300933,
+   "lastBorrowBlock": 26300933,
+   "borrowTxs": [
+    "0xa85766c2c92d39d499715d5148e638832cf8d757fee412ce68fd821732c9235d"
+   ]
+  },
+  {
+   "address": "0x3d89d2653636eecdd286b7399c194d885ac1a159",
+   "totalBorrowedEth": 3,
+   "borrowCount": 1,
+   "totalRepaidEth": 3,
+   "repaidFull": true,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 18587,
+   "firstBorrowBlock": 26301061,
+   "lastBorrowBlock": 26301061,
+   "borrowTxs": [
+    "0xa7dfce50165891003477b844181883351d3e9cc8296307609bbfaa8bd87265cb"
+   ]
+  },
+  {
+   "address": "0x1172f4200424adecd8caedad096ad3fbb6e333f3",
+   "totalBorrowedEth": 2.2914,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 48796,
+   "firstBorrowBlock": 26301113,
+   "lastBorrowBlock": 26301113,
+   "borrowTxs": [
+    "0xb62cb7deb5d757529f9da3bceb2c62fa8714af18bc1f8ce21758dde80a97e6f4"
+   ]
+  },
+  {
+   "address": "0x8f8d0ae3e2d11b3b3f962aab7d19ebe01345cbd9",
+   "totalBorrowedEth": 1.79,
+   "borrowCount": 1,
+   "totalRepaidEth": 1.79,
+   "repaidFull": true,
+   "suppliedUsdt": 2499,
+   "suppliedUsdc": 3147,
+   "firstBorrowBlock": 26300850,
+   "lastBorrowBlock": 26300850,
+   "borrowTxs": [
+    "0x9b74c2019ca01fc01140ab01193ae739620dea53e4ef056eb07ef5716f09cf49"
+   ]
+  },
+  {
+   "address": "0x99b68f6a5455493d9151ce8a1d0c4b609d69bd8e",
+   "totalBorrowedEth": 0.7777,
+   "borrowCount": 1,
+   "totalRepaidEth": 0,
+   "repaidFull": false,
+   "suppliedUsdt": 0,
+   "suppliedUsdc": 0,
+   "firstBorrowBlock": 26301004,
+   "lastBorrowBlock": 26301004,
+   "borrowTxs": [
+    "0x75fcaac86a6f55e933600cc88888e75a9b7beb337020a587b90422913b4a3e19"
+   ]
+  }
+ ],
+ "userOnly": [
+  "0xd01607c3c5ecaba394d8be377a08590149325722",
+  "0x8bdaa15ddc4d831f5b28660c6c18ef808a2c5c67",
+  "0x571b96b9bf20a4c57e8ba63fc1b5fc4079680cd7",
+  "0xb46ba477050450d698e605d3abd109f624edbc0a",
+  "0xa0f4819272b96f5473d403af27cfcf20a48666e3"
+ ],
+ "window": {
+  "from": 26300769,
+  "to": 26302559,
+  "t0": 1793305440,
+  "t1": 1793327040
+ }
+}

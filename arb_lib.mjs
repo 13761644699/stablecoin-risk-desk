@@ -1,0 +1,417 @@
+// arb_lib.mjs — 套利情报体系共享库（价差监控 / 地址跟踪 / 事件队列 / 兜底共用）
+// 职责：以太坊 RPC（公共节点轮换）、Keccak、Chainlink 预言机读价、Uniswap V3
+// 白名单池读价（slot0 中间价 + 单 tick 区间近似市价模拟）、币安现货中间价、
+// Aave 储备状态、事件队列读写、PushPlus 发送。
+// 推送时序（2026-10-30 用户定稿）：机会类事件一律先入队深化、分析完再推；
+// 本库的 sendPushplus 只供「兜底提示」与「已研判事件的解除通知」使用。
+import fs from 'fs';
+import path from 'path';
+
+export const DESK_DIR = path.dirname(new URL(import.meta.url).pathname);
+export const STATE_DIR = path.join(DESK_DIR, 'state');
+export const NO_PUSH = process.env.ARB_NO_PUSH === '1';
+export const QUEUE_FILE = path.join(STATE_DIR, NO_PUSH ? 'arb_event_queue.dryrun.jsonl' : 'arb_event_queue.jsonl');
+export const DONE_FILE = path.join(STATE_DIR, 'arb_event_done.jsonl');
+
+// ---------------- Keccak-256（已用空串/Transfer 向量自检） ----------------
+const MASK = (1n << 64n) - 1n;
+const RC = [0x0000000000000001n,0x0000000000008082n,0x800000000000808an,0x8000000080008000n,0x000000000000808bn,0x0000000080000001n,0x8000000080008081n,0x8000000000008009n,0x000000000000008an,0x0000000000000088n,0x0000000080008009n,0x000000008000000an,0x000000008000808bn,0x800000000000008bn,0x8000000000008089n,0x8000000000008003n,0x8000000000008002n,0x8000000000000080n,0x000000000000800an,0x800000008000000an,0x8000000080008081n,0x8000000000008080n,0x0000000080000001n,0x8000000080008008n];
+const R = [[0,36,3,41,18],[1,44,10,45,2],[62,6,43,15,61],[28,55,25,21,56],[27,20,39,8,14]];
+const rotl = (v, n) => n === 0 ? v : (((v << BigInt(n)) | (v >> BigInt(64 - n))) & MASK);
+function keccakF(state) {
+  for (let round = 0; round < 24; round++) {
+    const C = [], D = [];
+    for (let x = 0; x < 5; x++) C[x] = state[x] ^ state[x+5] ^ state[x+10] ^ state[x+15] ^ state[x+20];
+    for (let x = 0; x < 5; x++) D[x] = C[(x+4)%5] ^ rotl(C[(x+1)%5], 1);
+    for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) state[x+5*y] ^= D[x];
+    const B = new Array(25).fill(0n);
+    for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) B[y + 5*((2*x+3*y)%5)] = rotl(state[x+5*y], R[x][y]);
+    for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) state[x+5*y] = B[x+5*y] ^ ((~B[((x+1)%5)+5*y] & MASK) & B[((x+2)%5)+5*y]);
+    state[0] ^= RC[round];
+  }
+}
+export function keccak256(data) {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  const rate = 136;
+  const state = new Array(25).fill(0n);
+  const padded = Array.from(bytes);
+  padded.push(0x01);
+  while (padded.length % rate !== rate - 1) padded.push(0);
+  padded.push(0x80);
+  for (let off = 0; off < padded.length; off += rate) {
+    for (let i = 0; i < rate / 8; i++) {
+      let lane = 0n;
+      for (let j = 0; j < 8; j++) lane |= BigInt(padded[off + i*8 + j]) << BigInt(8*j);
+      state[i] ^= lane;
+    }
+    keccakF(state);
+  }
+  const out = [];
+  for (let i = 0; i < 4; i++) { let lane = state[i]; for (let j = 0; j < 8; j++) { out.push(Number(lane & 0xffn)); lane >>= 8n; } }
+  return out.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+export const selector = (sig) => '0x' + keccak256(sig).slice(0, 8);
+export const topicAddr = (a) => '0x' + '0'.repeat(24) + a.replace(/^0x/, '').toLowerCase();
+export const logAddr = (t) => '0x' + t.slice(26).toLowerCase();
+export const wordAddr = (w) => '0x' + w.slice(24).toLowerCase();
+export const wordUint = (w) => BigInt('0x' + w);
+export function splitData(data) {
+  const d = data.replace(/^0x/, '');
+  const words = [];
+  for (let i = 0; i < d.length; i += 64) words.push(d.slice(i, i + 64));
+  return words;
+}
+export const encAddr = (a) => a.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+export const encUint = (n) => BigInt(n).toString(16).padStart(64, '0');
+
+// ---------------- RPC ----------------
+export const RPCS = [
+  'https://ethereum-rpc.publicnode.com',
+  'https://eth.llamarpc.com',
+  'https://eth.drpc.org',
+  'https://1rpc.io/eth',
+  'https://eth-mainnet.public.blastapi.io',
+];
+let rpcIdx = 0;
+export async function rpc(method, params, tries = RPCS.length) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    const url = RPCS[(rpcIdx + i) % RPCS.length];
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(20000) });
+      const j = await r.json();
+      if (j.error) throw new Error(JSON.stringify(j.error).slice(0, 160));
+      rpcIdx = (rpcIdx + i) % RPCS.length;
+      return j.result;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('all RPCs failed');
+}
+export const ethCall = (to, data, block = 'latest') => rpc('eth_call', [{ to, data }, block]);
+export const hexN = (n) => '0x' + n.toString(16);
+export async function getLogs(address, topics, from, to, chunk = 400) {
+  const out = [];
+  for (let s = from; s <= to; s += chunk) {
+    const e = Math.min(s + chunk - 1, to);
+    const logs = await rpc('eth_getLogs', [{ address, topics, fromBlock: hexN(s), toBlock: hexN(e) }]);
+    out.push(...logs);
+  }
+  return out;
+}
+
+// ---------------- Chainlink ----------------
+export const FEEDS = {
+  'ETH/USD': '0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419',
+  'BTC/USD': '0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c',
+};
+export async function chainlinkPrice(feedAddr) {
+  const res = await ethCall(feedAddr, selector('latestRoundData()'));
+  const w = splitData(res);
+  const answer = Number(wordUint(w[1])) / 1e8;
+  const updatedAt = Number(wordUint(w[3]));
+  return { price: answer, updatedAt };
+}
+
+// ---------------- 币安现货中间价（报价纪律：中间价，不用最新成交价） ----------------
+export async function binanceMid(symbol) {
+  const r = await fetch(`https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=${symbol}`,
+    { signal: AbortSignal.timeout(10000) });
+  if (!r.ok) return null;
+  const j = await r.json();
+  const bid = Number(j.bidPrice), ask = Number(j.askPrice);
+  return bid > 0 && ask > 0 ? (bid + ask) / 2 : null;
+}
+
+// ---------------- Uniswap V3 白名单池 ----------------
+export const V3_FACTORY = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
+export async function v3GetPool(tokenA, tokenB, fee) {
+  const res = await ethCall(V3_FACTORY, selector('getPool(address,address,uint24)') + encAddr(tokenA) + encAddr(tokenB) + encUint(fee));
+  const a = wordAddr(splitData(res)[0]);
+  return a === '0x0000000000000000000000000000000000000000' ? null : a;
+}
+// 读池状态：slot0 中间价（token1/token0，人类单位）、池内两币余额、active liquidity。
+// priceOf(quotePerBase)：返回 1 单位 baseToken 的 quoteToken 价（人类单位）。
+export async function v3PoolState(pool, baseToken, baseDec, quoteToken, quoteDec) {
+  const [slot0Res, liqRes, balBaseRes, balQuoteRes] = await Promise.all([
+    ethCall(pool, selector('slot0()')),
+    ethCall(pool, selector('liquidity()')),
+    ethCall(baseToken, selector('balanceOf(address)') + encAddr(pool)),
+    ethCall(quoteToken, selector('balanceOf(address)') + encAddr(pool)),
+  ]);
+  const sqrtP = wordUint(splitData(slot0Res)[0]); // Q96
+  const liquidity = wordUint(splitData(liqRes)[0]);
+  const balBase = Number(wordUint(splitData(balBaseRes)[0])) / 10 ** baseDec;
+  const balQuote = Number(wordUint(splitData(balQuoteRes)[0])) / 10 ** quoteDec;
+  // 判断 token0/token1 次序：Uniswap 按地址排序
+  const baseIsToken0 = baseToken.toLowerCase() < quoteToken.toLowerCase();
+  // sqrtPriceX96^2 / 2^192 = token1_raw / token0_raw
+  const raw = Number((sqrtP * sqrtP) / (1n << 96n)) / Number(1n << 96n);
+  // price(token0 in token1, human) = raw * 10^(dec0-dec1)
+  const dec0 = baseIsToken0 ? baseDec : quoteDec;
+  const dec1 = baseIsToken0 ? quoteDec : baseDec;
+  const price0in1 = raw * 10 ** (dec0 - dec1);
+  const priceBaseInQuote = baseIsToken0 ? price0in1 : 1 / price0in1;
+  return { sqrtP, liquidity, balBase, balQuote, priceBaseInQuote, baseIsToken0 };
+}
+// 单 tick 区间近似市价模拟（raw 量纲）：卖出 amountBaseRaw 个 base 换 quote。
+// 集中流动性跨 tick 时高估成交价，只作准入/规模估算，研判时以实测为准。
+export function v3SimSellRaw(sqrtP, L, baseIsToken0, amountBaseRaw) {
+  // 返回 { avgRaw } token1/token0 raw 比价的成交均价（raw），或 null
+  const Q96 = 1n << 96n;
+  if (L <= 0n || amountBaseRaw <= 0n) return null;
+  if (baseIsToken0) {
+    // 卖 token0 得 token1：sqrtP 下降。1/sqrtP' = 1/sqrtP + dx/L（raw 量纲下 dx 以 token0 raw 计）
+    // 用定点：inv = Q96*Q96/sqrtP 表示 1/sqrtP 的 Q96 定点
+    const inv = (Q96 * Q96) / sqrtP;
+    const invNew = inv + (amountBaseRaw * Q96) / L;
+    const sqrtPNew = (Q96 * Q96) / invNew;
+    const dy = (L * (sqrtP - sqrtPNew)) / Q96; // token1 raw out
+    if (dy <= 0n) return null;
+    return { amountOutRaw: dy, sqrtPNew };
+  }
+  // 卖 token1 得 token0：sqrtP 上升。sqrtP' = sqrtP + dy*L 关系：dx_out = L*(1/sqrtP - 1/sqrtP')
+  const sqrtPNew = sqrtP + (amountBaseRaw * Q96) / L;
+  const dx = (L * ((Q96 * Q96) / sqrtP - (Q96 * Q96) / sqrtPNew)) / Q96; // token0 raw out
+  if (dx <= 0n) return null;
+  return { amountOutRaw: dx, sqrtPNew };
+}
+
+// ---------------- Aave V3 ----------------
+export const AAVE_POOL = '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2';
+export const AAVE_DATA_PROVIDER = '0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3';
+export const TOKENS = {
+  WETH: { address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', decimals: 18, symbol: 'WETH' },
+  WBTC: { address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599', decimals: 8, symbol: 'WBTC' },
+  USDT: { address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', decimals: 6, symbol: 'USDT' },
+  USDC: { address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', decimals: 6, symbol: 'USDC' },
+};
+export const RESERVE_BY_ADDR = Object.fromEntries(Object.values(TOKENS).map(t => [t.address.toLowerCase(), t]));
+// 储备状态：frozen/paused/borrowingEnabled（配置位图）+ 可借流动性（DataProvider）
+export async function aaveReserveState(assetAddr) {
+  const [cfgRes, dataRes] = await Promise.all([
+    ethCall(AAVE_POOL, selector('getConfiguration(address)') + encAddr(assetAddr)),
+    ethCall(AAVE_DATA_PROVIDER, selector('getReserveData(address)') + encAddr(assetAddr)),
+  ]);
+  const cfg = wordUint(splitData(cfgRes)[0]);
+  const d = splitData(dataRes);
+  return {
+    active: !!(cfg & (1n << 56n)),
+    frozen: !!(cfg & (1n << 57n)),
+    borrowingEnabled: !!(cfg & (1n << 58n)),
+    paused: !!(cfg & (1n << 60n)),
+    availableLiquidity: Number(wordUint(d[0])),
+    totalVariableDebt: Number(wordUint(d[2])),
+  };
+}
+export async function aaveAccountData(user) {
+  const res = await ethCall(AAVE_POOL, selector('getUserAccountData(address)') + encAddr(user));
+  const w = splitData(res).map(x => Number(wordUint(x)));
+  // 单位为 USD 1e8（base currency）
+  return { totalCollateralUsd: w[0] / 1e8, totalDebtUsd: w[1] / 1e8, availableBorrowsUsd: w[2] / 1e8, healthFactor: w[5] / 1e18 };
+}
+
+// ---------------- 时间/静默口径 ----------------
+export function cstHour(now = new Date()) {
+  return Number(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }));
+}
+export const isNightCst = (now = new Date()) => { const h = cstHour(now); return h >= 0 && h < 8; };
+export const isQuietCst = (now = new Date()) => { const h = cstHour(now); return h >= 0 && h < 10; }; // 00:00–10:00 不唤起/不推（severe 除外）
+// 非 severe 条目若在静默时段入队，其「应处理时刻」顺延到当日 10:00 CST。
+export function dueSince(entry, now = new Date()) {
+  let t = Date.parse(entry.enqueuedAt) || 0;
+  if (entry.notBefore) t = Math.max(t, Date.parse(entry.notBefore) || 0);
+  if (entry.severity !== 'severe') {
+    const enq = new Date(t);
+    if (isQuietCst(enq)) {
+      // 顺延到入队当日 10:00 CST（UTC+8）
+      const cst = new Date(enq.getTime() + 8 * 3600 * 1000);
+      cst.setUTCHours(10, 0, 0, 0);
+      t = Math.max(t, cst.getTime() - 8 * 3600 * 1000);
+    }
+  }
+  return t;
+}
+export function isDue(entry, now = new Date()) {
+  if (entry.notBefore && Date.parse(entry.notBefore) > now.getTime()) return false;
+  if (entry.severity !== 'severe' && isQuietCst(now)) return false;
+  return true;
+}
+
+// ---------------- Kraken USD 锚（批量，供交叉对源头换算） ----------------
+const KRAKEN_API = 'https://api.kraken.com/0/public';
+// 返回 {SYM: USD 中间价}（报价纪律：买卖中间价），只含 Kraken 有真实 USD 对的
+// 币种；整体取不到返回 {}。
+export async function krakenUsdRefs(symbols) {
+  const pairsRes = await (await fetch(`${KRAKEN_API}/AssetPairs`)).json();
+  const byKey = {};
+  for (const want of symbols) {
+    for (const [k, v] of Object.entries(pairsRes?.result || {})) {
+      if (v.altname === `${want}USD` || v.wsname === `${want}/USD`) { byKey[k] = want; break; }
+    }
+  }
+  const keys = Object.keys(byKey);
+  if (!keys.length) return {};
+  const tick = await (await fetch(`${KRAKEN_API}/Ticker?pair=${keys.join(',')}`)).json();
+  const out = {};
+  for (const k of keys) {
+    const t = tick?.result?.[k];
+    const bid = Number(t?.b?.[0]), ask = Number(t?.a?.[0]);
+    if (bid > 0 && ask > 0) out[byKey[k]] = (bid + ask) / 2;
+  }
+  return out;
+}
+
+// ---------------- 场所状态门（F7，2026-10-30） ----------------
+// state/venue_status.json：场所充提状态标记文件（维护口径见 ARB_INTEGRATION.md
+// 第 8/9 节：优先官方状态/公告，脚本关键词判定为辅；拿不到可靠自动源时人工核
+// 后改此文件，不伪造自动化）。主要场所充提冻结/暂停期间，该场所自身价格含
+// 「出不去的钱打折」成分——其脱锚/折价类事件只记档+背景、不推送；研判路径
+// 凡涉及冻结场所的腿一律判不可执行。只有明确 frozen 才门控；unknown /
+// normal 不门控。
+export function readVenueStatus() {
+  try { return JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'venue_status.json'), 'utf8')); }
+  catch { return { venues: {} }; }
+}
+export function venueDwFrozen(venue) {
+  if (!venue) return false;
+  const v = (readVenueStatus().venues || {})[venue];
+  return !!v && v.depositWithdraw === 'frozen';
+}
+
+// 某条目 id 是否在 withinMs 内已有 done 记录（研判已处理过）。
+export function arbDoneRecent(id, withinMs) {
+  for (const r of readDone()) {
+    if (r.id === id) return Date.now() - new Date(r.at).getTime() < withinMs;
+  }
+  return false;
+}
+
+// ---------------- 事件队列 ----------------
+// 条目：{ id, type, key, severity: 'severe'|'warn'|'event', enqueuedAt, notBefore,
+//         payload: {...}, factsText: string }
+// 同 type+key 的未处理条目重复入队 → 合并更新 payload（保留首次 enqueuedAt，
+// 兜底时钟不被刷新掩盖）。
+export function readQueue() {
+  try {
+    return fs.readFileSync(QUEUE_FILE, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+function writeQueue(entries) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const tmp = QUEUE_FILE + '.tmp';
+  fs.writeFileSync(tmp, entries.map(e => JSON.stringify(e)).join('\n') + (entries.length ? '\n' : ''));
+  fs.renameSync(tmp, QUEUE_FILE);
+}
+export function readDone() {
+  try {
+    return fs.readFileSync(DONE_FILE, 'utf8').split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+export function enqueueArbEvent(evt) {
+  const q = readQueue();
+  const done = new Set(readDone().map(d => d.id));
+  const id = evt.id || `${evt.type}:${evt.key}`;
+  if (done.has(id + '@' + new Date().toISOString().slice(0, 10))) { /* 日内同 id 已处理过：仍允许新事件（id 带轮次时调用方区分） */ }
+  const idx = q.findIndex(e => e.id === id);
+  const nowIso = new Date().toISOString();
+  if (idx >= 0) {
+    const prev = q[idx];
+    q[idx] = { ...prev, ...evt, id, enqueuedAt: prev.enqueuedAt, updatedAt: nowIso,
+      severity: (prev.severity === 'severe' || evt.severity === 'severe') ? 'severe' : (evt.severity || prev.severity) };
+    writeQueue(q);
+    return { merged: true, enqueued: true, id };
+  }
+  q.push({ ...evt, id, enqueuedAt: nowIso });
+  writeQueue(q);
+  return { merged: false, enqueued: true, id };
+}
+export function removeFromQueue(id) {
+  const q = readQueue().filter(e => e.id !== id);
+  writeQueue(q);
+}
+export function appendDone(rec) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.appendFileSync(DONE_FILE, JSON.stringify({ ...rec, at: new Date().toISOString() }) + '\n');
+}
+
+// ---------------- PushPlus（仅兜底提示/解除通知；token 绝不打印） ----------------
+export async function sendPushplus(title, content) {
+  if (NO_PUSH) { console.log(`[arb][NO_PUSH] would push: ${title}`); return { ok: true, dry: true }; }
+  let token = '';
+  try { token = fs.readFileSync(process.env.HOME + '/workspace/dividend-detector/.pushplus_token', 'utf8').trim(); } catch { /* handled below */ }
+  if (!token) return { ok: false, error: 'no token' };
+  try {
+    const r = await fetch('https://www.pushplus.plus/send', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token, title, content, template: 'txt' }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const j = await r.json().catch(() => ({}));
+    return { ok: j.code === 200, code: j.code };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ---------------- 脱锚事件标记（研判完成后回写 depeg_events.json） ----------------
+export function markDepegEvent(key, { pushed = false, enriched = true } = {}) {
+  const file = path.join(STATE_DIR, 'depeg_events.json');
+  let store;
+  try { store = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return false; }
+  const ev = (store.events || {})[key];
+  if (!ev) return false;
+  if (enriched) ev.enriched = true;
+  if (pushed) { ev.lastPushAt = new Date().toISOString(); ev.lastPushKind = 'arb-deepened'; }
+  ev.arbDeepened = true;
+  fs.writeFileSync(file, JSON.stringify(store, null, 1));
+  return true;
+}
+
+
+// ---------------- 事件小结与可成交速览（2026-10-30 午后，用户指示借鉴外部盯跌器呈现） ----------------
+// 口径：恢复小结只对研判层「实际推送过」的事件发（done 账本 pushed=true 为准，
+// 入队不算推过）；峰值/时长/可成交量逐项标注口径，不许把池流动性说成可买量。
+export function fmtDurMin(firstSeenIso, endIso) {
+  const mins = Math.max(1, Math.round((Date.parse(endIso) - Date.parse(firstSeenIso)) / 60000));
+  if (mins < 60) return `${mins} 分钟`;
+  const h = Math.floor(mins / 60), m = mins % 60;
+  return m ? `${h} 小时 ${m} 分钟` : `${h} 小时`;
+}
+export function researchPushed(type, key, sinceIso) {
+  const id = `${type}:${key}`;
+  const since = sinceIso ? Date.parse(sinceIso) : 0;
+  return readDone().some(d => d.id === id && d.pushed && Date.parse(d.at || 0) >= since);
+}
+export const CASEBOOK_FILE = path.join(DESK_DIR, 'INCIDENT_CASEBOOK.md');
+export function appendEpisodeSummary({ type, key, peakTxt = '', durMin = null, volumeTxt = '', at = new Date().toISOString() }) {
+  const line = `- ${at.slice(0, 10)} ${type} ${key}｜${peakTxt}${durMin != null ? `｜持续约 ${durMin} 分钟` : ''}${volumeTxt ? `｜${volumeTxt}` : ''}｜已恢复`;
+  try { fs.appendFileSync(CASEBOOK_FILE, line + '\n'); return true; } catch { return false; }
+}
+// 兜底简讯用的当刻可成交速览：读生产者当前事件记录，取其自有模拟/流动性字段拼一行；无数据返回 null。
+export function executableSnapshot(entry) {
+  try {
+    if (entry.type === 'depeg') {
+      const store = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'depeg_events.json'), 'utf8'));
+      const ev = (store.events || {})[entry.key];
+      if (!ev) return null;
+      const liq = ev.peakLiqUsd || ev.liq;
+      const px = ev.method === 'cex-lst' ? `比率 ${Number(ev.price).toFixed(4)}` : `现价 $${Number(ev.price).toFixed(4)}`;
+      return `可成交速览：${ev.pair || entry.key} ${px}（偏离 ${Number(ev.devBps).toFixed(1)} bps）${liq ? `，主池流动性 $${Math.round(liq).toLocaleString()}` : ''}`;
+    }
+    if (entry.type === 'cex_dip') {
+      const store = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'cex_dip_events.json'), 'utf8'));
+      const ev = (store.events || {})[entry.key];
+      if (!ev) return null;
+      const parts = [];
+      if (ev.sim10) parts.push(`买 $10K 均价 $${ev.sim10.avgUsd.toFixed(4)}`);
+      if (ev.sim30) parts.push(`买 $30K 均价 $${ev.sim30.avgUsd.toFixed(4)}`);
+      if (ev.peakBuyableUsd) parts.push(`事件价位内最大可买量约 $${Math.round(ev.peakBuyableUsd).toLocaleString()}`);
+      return parts.length ? `可成交速览（${ev.venue} 当刻盘口模拟）：${parts.join('；')}` : null;
+    }
+    if (entry.type === 'spread') {
+      const p = entry.payload || {};
+      if (p.poolTvlUsd) return `可成交速览：主池 ${p.pool || entry.key} TVL $${Math.round(p.poolTvlUsd).toLocaleString()}（深度以研判当刻模拟为准）`;
+      return null;
+    }
+  } catch { return null; }
+  return null;
+}

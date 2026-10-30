@@ -1,0 +1,21 @@
+[Unit]
+Description=Stablecoin Risk Desk API + 脱锚套利监控（常驻）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hatch/workspace/stablecoin-risk-desk
+ExecStart=/usr/bin/node server.js
+Environment=PORT=8787
+Environment=DEPEG_MONITOR_ENABLED=1
+Environment=DEPEG_SCAN_INTERVAL_MS=300000
+# PushPlus token 默认从 /home/hatch/workspace/dividend-detector/.pushplus_token 读取
+# （见 server.js PUSHPLUS_TOKEN_FILE；也可用 Environment=PUSHPLUS_TOKEN=... 覆盖，不建议）
+Restart=on-failure
+RestartSec=10
+# 日志：journalctl -u stablecoin-risk-desk -f
+
+[Install]
+WantedBy=multi-user.target
