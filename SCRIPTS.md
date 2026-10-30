@@ -6,7 +6,7 @@
 
 | 脚本 | 干什么 | 谁在调用 |
 |---|---|---|
-| `sweep_loop.sh` | 脱锚巡检常驻循环，每 5 分钟：A server.js 健康检查 + B cex_lst_watch + C arb_spread_watch + D arb_addr_watch + E arb_fallback | all-loops-watchdog 保活 |
+| `sweep_loop.sh` | 脱锚巡检常驻循环，每 5 分钟：A server.js 健康检查 + B cex_lst_watch + C arb_spread_watch + D arb_addr_watch + E arb_fallback + F news_ignite_watch | all-loops-watchdog 保活 |
 | `server.js` | 脱锚事件服务（HTTP API + 事件状态机），机会类改入队深化（enqueueDepegArb）、解除直发 | sweep_loop.sh 健康检查，挂了自动重启 |
 | `cex_lst_watch.mjs` | CEX 稳定币现货 + LST 价格监控；2026-10-30 起触发入统一队列（原直推已拆）、场所状态门 F7（state/venue_status.json） | sweep_loop.sh 每轮调用 |
 | `cex_dip_watch.mjs` | 交易所逐所盯跌（进程内 10s/30s 自轮询）；机会类经 deps.enqueueArb 入队、resolved 直发 | server.js 启动时拉起 |
@@ -14,6 +14,7 @@
 | `arb_lib.mjs` | 套利整合共享底座（RPC/Chainlink/币安/V3 模拟/Aave/统一队列/PushPlus） | 全部 arb_* 组件共用 |
 | `arb_spread_watch.mjs` | 主流币三方价差监控（ETH/WBTC：DEX 白名单池 vs 预言机 vs 币安），越线入队 | sweep_loop.sh 每轮 C 段 |
 | `arb_addr_watch.mjs` | 元套利地址跟踪（Aave V3 事件增量 + 种子库过滤），大额借入入队 | sweep_loop.sh 每轮 D 段 |
+| `news_ignite_watch.mjs` | 快讯点火（TG 公开源触发待核事件，脚本市场核查过升级门才入队；新闻只点火不定性） | sweep_loop.sh 每轮 F 段 |
 | `arb_fallback.mjs` | 研判兜底：队列超 10 分钟未处理推简短提示；已消解条目静默清除 | sweep_loop.sh 每轮 E 段 |
 | ~~`arb_ignite.mjs`~~ | 公告点火器：**2026-10-30 已撤**（用户拍板：公告每天一轮、提前量为负），已移 archive/arb_ignite.mjs.retired-2026-10-30-announcement-too-slow；公告流程 Z 节已摘除 | — |
 | `arb_event_context.mjs` | 研判上下文包 CLI（按条目 id 输出当刻实测全集，含 F1 独立 USD 锚 usdAnchorRef） | 研判 agent 调用 |

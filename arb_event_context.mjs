@@ -20,7 +20,7 @@ const key = entry?.key || id.split(':').slice(1).join(':');
 const safe = async (fn) => { try { return await fn(); } catch (e) { return { error: String(e).slice(0, 120) }; } };
 const loadJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
 
-if (type === 'spread' || type === 'arb_addr') {
+if (type === 'spread' || type === 'arb_addr' || type === 'news_ignite') {
   const sym = type === 'spread' ? key : null;
   const [clEth, clBtc, bnEth, bnBtc] = await Promise.all([
     safe(() => chainlinkPrice(FEEDS['ETH/USD'])), safe(() => chainlinkPrice(FEEDS['BTC/USD'])),
@@ -64,9 +64,12 @@ if (type === 'depeg' || type === 'cex_dip') {
     const bands = loadJson(path.join(STATE_DIR, 'cex_dip_bands.json'), { combos: {} });
     out.cexDipBand = (bands.combos || {})[key] || null;
   }
-  // 独立 USD 锚参考（校准规则 F1，2026-10-30 昨晚复盘）：标的与计价币（USDT/USDC）
-  // 在 Kraken 的 USD 中间价——非同对、非同计价币，供研判把交叉对偏离分解为
-  // 「标的自身偏离」与「计价币偏离」，避免 USDC/USDS 式交叉对幻影重演。
+  // 独立 USD 锚参考（校准规则 F1，2026-10-30 昨晚复盘；同日样本外建议 4 加双锚）：
+  // 标的与计价币（USDT/USDC）在 Kraken 与 Coinbase 的 USD 中间价——非同对、
+  // 非同计价币，供研判把交叉对偏离分解为「标的自身偏离」与「计价币偏离」，
+  // 避免 USDC/USDS 式交叉对幻影重演。双锚交叉防单锚被薄盘口毒化：两锚分歧
+  // 以 bps 列在 divergenceBps，分歧大时研判须标注并按深度取舍，不得只凭单锚下结论。
+  // Coinbase 无 USDC-USD 对（USDC 在该所按 USD 等值处理），USDC 锚只有 Kraken 一源。
   // 报价纪律：用买卖中间价，不用最新成交价。
   const sym = entry?.payload?.symbol || String(key).split(/[:@]/)[0];
   out.usdAnchorRef = await safe(async () => {
@@ -77,18 +80,56 @@ if (type === 'depeg' || type === 'cex_dip') {
       if (want.has(v.altname) && !String(v.altname).includes('.')) byAlt[v.altname] = k;
     }
     const keys = Object.values(byAlt);
-    if (!keys.length) return {};
-    const tk = await (await fetch(`https://api.kraken.com/0/public/Ticker?pair=${keys.join(',')}`, { signal: AbortSignal.timeout(8000) })).json();
-    const refs = {};
-    for (const [alt, k] of Object.entries(byAlt)) {
-      const t = tk.result?.[k];
-      const bid = Number(t?.b?.[0]), ask = Number(t?.a?.[0]);
-      if (bid > 0 && ask > 0) refs[alt] = (bid + ask) / 2;
+    const kraken = {}, krakenVol = {};
+    if (keys.length) {
+      const tk = await (await fetch(`https://api.kraken.com/0/public/Ticker?pair=${keys.join(',')}`, { signal: AbortSignal.timeout(8000) })).json();
+      for (const [alt, k] of Object.entries(byAlt)) {
+        const t = tk.result?.[k];
+        const bid = Number(t?.b?.[0]), ask = Number(t?.a?.[0]);
+        if (bid > 0 && ask > 0) {
+          kraken[alt] = (bid + ask) / 2;
+          const v24 = Number(t?.v?.[1]); // Kraken 24h 成交量（基础币）
+          if (v24 > 0) krakenVol[alt] = Math.round(v24 * kraken[alt]);
+        }
+      }
     }
-    return refs;
+    const coinbase = {}, coinbaseVol = {};
+    for (const alt of want) {
+      const base = alt.replace(/USD$/, '');
+      if (!base || base === 'USDC') continue;
+      try {
+        const t = await (await fetch(`https://api.exchange.coinbase.com/products/${base}-USD/ticker`, { signal: AbortSignal.timeout(8000) })).json();
+        const bid = Number(t?.bid), ask = Number(t?.ask);
+        if (bid > 0 && ask > 0) {
+          coinbase[alt] = (bid + ask) / 2;
+          const v24 = Number(t?.volume); // Coinbase 24h 成交量（基础币）
+          if (v24 > 0) coinbaseVol[alt] = Math.round(v24 * coinbase[alt]);
+        }
+      } catch { /* 该标的在 Coinbase 无对应 USD 对时跳过 */ }
+    }
+    const divergenceBps = {};
+    for (const alt of Object.keys(coinbase)) {
+      if (kraken[alt]) divergenceBps[alt] = Math.round(Math.abs(coinbase[alt] - kraken[alt]) / kraken[alt] * 10000);
+    }
+    // volUsd：两锚 24h 成交量（USD 口径），供 F1 分歧标注时按量取舍（第二轮回放修正 3）
+    return { kraken, coinbase, divergenceBps, volUsd: { kraken: krakenVol, coinbase: coinbaseVol } };
   });
   const [clEth] = await Promise.all([safe(() => chainlinkPrice(FEEDS['ETH/USD']))]);
   out.chainlinkEth = clEth;
+}
+
+if (type === 'news_ignite') {
+  // 快讯点火：新闻只点火，研判须以当刻市场数据定性——附场所状态门与脱锚台现况
+  out.venueStatus = loadJson(path.join(STATE_DIR, 'venue_status.json'), {});
+  out.newsPending = (() => {
+    const p = loadJson(path.join(STATE_DIR, 'news_pending.json'), { events: [] });
+    return (p.events || []).find(e => e.fp === key) || null;
+  })();
+  out.desk = await safe(async () => {
+    const r = await fetch('http://127.0.0.1:8787/api/depeg-monitor', { signal: AbortSignal.timeout(8000) });
+    const j = await r.json();
+    return { state: j.state, thresholds: j.thresholds, active: j.active || [] };
+  });
 }
 
 console.log(JSON.stringify(out, null, 1));

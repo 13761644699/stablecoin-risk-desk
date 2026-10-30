@@ -166,3 +166,41 @@
 
 - **可成交速览（①）**：兜底简讯正文新增一行（arb_lib `executableSnapshot` 读生产者当前事件记录：cex_dip 给 $10K/$30K 模拟均价与事件价位内最大可买量、depeg 给现价/偏离/主池流动性、spread 给主池 TVL）；研判推送结论行后同步加此行（RESEARCH_SPEC §2 第 1 条 + arb-deep prompt 正文结构）。尺度口径按用户复议：报「能买到多少量」即可，$1,000–$50,000 均可，逐项注明模拟口径。
 - **恢复小结（②）**：三条机会线原本各有解除推送但字段不齐、且 cex_dip 的门槛是「入队即算推过」。现统一为：只对研判层**实际推送过**的事件（done 账本 pushed=true；depeg 沿用 lastPushAt，其语义已与实际推送对齐）发小结，字段 = 峰值偏离 + 持续时长 + 期间可成交量（cex_dip 新增 `buyableWithinCap` 三档模拟跟踪 `peakBuyableUsd`，已用合成盘口四用例验证；depeg/spread 分别报主池流动性峰值/TVL 峰值，逐项标注口径不冒充可买量）；消解同时由 arb_lib `appendEpisodeSummary` 自动记入 INCIDENT_CASEBOOK「事件小结」节（半夜解除照旧只记档不推送）。server.js 与 cex_dip（进程内轮询）已重启加载，health 正常、盯跌轮询无报错。
+
+
+## 13. 快讯点火（2026-10-30 落地，用户拍板按 prep_news_ignition.md 草稿建）
+
+第 7 节撤公告点火时留的设计原则在此兑现：触发源换成快速新闻/安全情报源，仍只作触发、定性靠市场数据。
+
+- **脚本**：`news_ignite_watch.mjs`，并入 sweep_loop 每轮 F 段（脚本内节流 240 秒），零新增常驻进程、零新增 cron；只入统一研判队列，不直推，研判走既有 arb-deep hook。
+- **源（2026-10-30 实测可达，TG 公开预览页 t.me/s/，无账号零付费）**：一级 security 组 PeckShieldAlert、CyversAlerts；一级补充 news 组 wublockchainenglish（吴说英文）；二级 flash 组 ForesightNews、Odailychina。BlockSec/SlowMist/PANews 无公开预览页、未接，待 X API（prep_x）拍板后补。已知局限：PeckShield 与 Odaily 的 /s/ 预览只吐极少帖子（实测 1–2 条），5 分钟轮询仍能抓住最新一条，但短时连发可能漏中间条目。
+- **触发纪律**：高危动作词（被盗/黑客/漏洞/私钥/热钱包/异常流出/暂停充提/冻结资产等，中英双语）命中且过重要性门（已知场所/协议/稳定币实体，或金额 ≥$10M，或 ≥$1M 且提及交易所/协议）才建「待核事件」；维护类暂停（带 maintenance/维护且无黑客类词）不点火；价格涨跌类不点火。待核事件指纹 = 动作类:实体，存 `state/news_pending.json`，6 小时未升级自动过期记档。
+- **独立确认口径**：后到消息若提及已记录来源的别名（如「据 PeckShield」），判为转述（echo），不计独立确认，防止多家转述同一原文凑出多源。
+- **升级门（任一过门才入队 type=news_ignite）**：G1 市场共现——三方价差处于严重线，或脱锚/盯跌/价差任一市场线已就相关事件入队；G2 双源确认——≥2 个独立来源组确认同一事件且有状态证据（快讯含充提暂停/冻结表述，或 `venue_status.json` 标该场所 frozen）；G3 链上共现——元地址在事件窗口内有大额借入入队记录。
+- **状态门降级说明**：草稿设想的交易所官方 status 页 JSON 端点实测本机不可达（OKX/Bybit/Gate 连接失败、Binance 子域 404），故状态证据降级为「快讯表述 + venue_status.json + 研判时现查」，与 F7 在研判层的现查要求叠加，不单独依赖脚本缓存。
+- **研判上下文**：`arb_event_context.mjs` 已加 news_ignite 分支——三方价格与 Aave 储备（与 spread 共用）+ 场所状态门全文 + 待核事件卡 + 脱锚台当前活跃事件。
+- **状态与统计**：`state/news_ignite_state.json`（分源游标，首轮只立基线不处理历史）、`state/news_pending.json`、`state/news_source_stats.json`（分源触发/全局升级/过期计数，供月度误报评估与降级）。
+- **验收（2026-10-30）**：分类器自测 8/8（昨晚币安事件句式、维护暂停、价格新闻、小额无名协议、发行方冻结等）；沙箱以回退游标回放昨晚真实报道流——吴说帖建待核卡、ForesightNews 作第二独立组确认、G2 过门入 dryrun 队列，全程 ARB_NO_PUSH=1 零真实推送；生产首轮五源基线完成、生产队列零扰动，sweep_loop 已重启加载 F 段（pid 11692，心跳正常）。
+- **运维账**：agent 唤起增量预计平日 0 次、事件日并入既有研判不另开口子；脚本抓取约 5 个公开页/5 分钟，机械活不占 agent。
+
+
+## 14. F4/F5/F7 样本外修订（2026-10-30，用户拍板按 replay_oos_report.md 头三条建议执行）
+
+样本外回放（三起事件：2023-03 USDC/SVB、2025-02 Bybit 被盗、2025-10-10 USDe 仅币安脱锚）对 F1–F7 的裁定与修订，报告 `~/workspace/research_notes/arb-system-redesign-20261030/replay_oos_report.md`。本节之前的 F4/F5/F7 引文（如第 9 节）为当时校准记录、不回改；现行规则以 `~/workspace/RESEARCH_SPEC.md` §3 为准，arb-deep-on-queue 的 prompt 已同步，INCIDENT_PLAYBOOK 第 4 步已同步。
+
+- **F4（原：分歧 ≥ 偏离量级 → 数据不可信降观察）被样本外反例修正**：2025-10-10 USDe@Binance 0.65 vs 场外 0.99（分歧约 3,400bps）底部 95 分钟成交 $7.29 亿属真实脱节，字面执行会误杀。现行：分歧触发先按两侧当刻成交量/深度裁决（F6 深度模拟即裁决步骤）——有量侧转逐所评估、无量侧按坏源剔除、两侧皆无深度背书才降观察。
+- **F5 三条件拆开排序**：决定性测试改为「退出通道存在且未冻结」；肇事方抛售单独成立；全市场 risk-off 降为背景因子、不得单独否决（事件丙证明它可以是脱节的成因而非执行障碍）。
+- **F7 补粒度与证据标准**：状态按（场所 × 资产 × 功能）记录（充值/提现/兑换/内部划转/发行方赎回分开；「兑换暂停」「划转延迟」不等于充提冻结）；「冻结」须官方状态页/公告或转账失败实证，第三方转述只记观察；「延迟/拥堵」单列一档。`state/venue_status.json` 的 _doc 已同步此维护口径（新增 functions 分项与 delayed 档，消费方均为严格等值判断、不受影响）。
+- 未采纳/未办：报告建议 4（F1 锚源先过 F6）、5（F3 多日事件中途更新）、6（快讯点火两问初筛）不在本次拍板范围，保持记录待议；F1/F3/F6 本次裁定为支持、维持现行文本。
+
+## 15. 样本外建议 4/5/6 处置（2026-10-30，用户拍板「6 全加、4 加双锚、5 只加状态变化一条」）
+
+- **第 6 条·点火两问初筛（全加）**：news_ignite_watch.mjs 新增 computeScreen——被盗类待核事件升级前先算 Q1（涉事场所充提实际冻结：venue_status 冻结或标题含暂停/冻结证据）/Q2（被盗资产 DEX 不计价换仓迹象：三方价差严重线或市场线已入队），两问皆否只记档不入队（Bybit 形态），证据后到可再过筛；screen 结果写入队列 payload 与 factsText，arb-deep prompt 定性步同步要求研判复核两问。自测扩至 13/13；沙箱回放昨晚报道流：币安事件 Q1=是、经 G2 入队且 payload 带 screen，Curve 被盗标题两问皆否被拦只记档。
+- **第 4 条·F1 双锚（克制版）**：arb_event_context 的 usdAnchorRef 由 Kraken 单锚改为 Kraken + Coinbase 双锚交叉，输出 {kraken, coinbase, divergenceBps}；RESEARCH_SPEC F1 与 arb-deep prompt 同步：两锚分歧 >20bps 须标注、按深度取舍，单锚异常不得单独支撑分解结论。已知缺口：Coinbase 无 USDC-USD 对（USDC 按 USD 等值处理），USDC 锚仍只有 Kraken 一源，研判时注明。不采用报告原案的「按深度排序选锚」复杂机制。
+- **第 5 条·F3 里程碑（只加一条）**：RESEARCH_SPEC F3 与 arb-deep prompt【合并降噪】同步加入唯一例外——同事件存续期间涉事场所状态变化（冻结→恢复或新冻结）允许发一条合并更新（决策信息）；新极值、回收过半不发，终点仍走恢复小结。实现层级为研判层规则（下一次研判该事件时执行），未新增脚本触发器。
+- 上线：sweep_loop 重启加载新版点火脚本（重启时发现该循环在 13:44 一轮环境重启后未自起，手动按规范拉起 pid 3195，server.js 随循环自检重启恢复）。第二轮样本外回放已派（专验修订后 F4/F5/F7 + 两问初筛 + 双锚分解一致性），结果回来后补记。
+
+## 16. 第二轮样本外回放（2026-10-30，结果：修订 6/6 通过）
+
+报告 `~/workspace/research_notes/arb-system-redesign-20261030/replay_oos/replay_oos_round2.md`（新数据 r2_ 前缀 4 份）。对修订后规则逐项复核：A F4 修订有效——丙靠 Binance 一手成交（<0.99 的 95 分钟 $7.291 亿）即可转逐所评估、不依赖场外 0.99 真伪；wstETH 仍正确降观察；Bitstamp 坏源单独剔除不拖累事件甲。B F5 修订有效——丙 ETH −16.3% 下场内 118 分钟零断档、Ethena 赎回零宕机（多源升级核实），乙复算仍无脱节。C F7 修订有效——甲三处「暂停」原文全是功能级（兑换/自动兑换/发行方流动性操作），乙 Bybit 提现从未暂停、正落 delayed 档（12.4h 清完积压），丙第三方转述只记观察。D 两问初筛有效——乙两问皆否只记档（9h 最大偏离复算 54bps），对照组昨晚 Q1 为是、溢价 +1,943bps 通过不误杀。E 双锚有效——96 小时两锚最大分歧 59bps（触发标注条款、不翻转结论），幻影约九成被 USDC 自身跌幅解释、两锚一致；Coinbase USDC-USD 实测 404，缺口属实。F F3 里程碑定性有效——59 小时内唯一触发点是联合声明（赎回腿可执行性翻转），全程只触发一次。报告另附三条最小修正建议（F4 补同源读数视为一侧、点火 Q1 注明冻结不含 delayed、锚分歧标注附两锚成交量），待用户拍板。
+- 三条最小修正已于同日落地（用户拍板全做）：①F4 裁决前先验来源独立性——同源读数只算一侧（规格 §3 F4 与 arb-deep prompt 同步）；②点火 Q1 口径注明冻结不含 delayed 档（规格 F7 尾注、prompt 定性步、点火 factsText 三处同步；脚本侧本就是 depositWithdraw 严格等值判断）；③usdAnchorRef 新增 volUsd（两锚 24h 成交量 USD 口径，Kraken 取 Ticker v[1]、Coinbase 取 ticker volume），沙箱实测返回正常（示例时点 Kraken USDT/USD $3.45 亿 vs Coinbase $0.59 亿）。

@@ -6,6 +6,8 @@
 #   C. 主流币三方价差监控 arb_spread_watch.mjs（2026-10-30 整合：越线只入队深化）
 #   D. 元套利地址跟踪 arb_addr_watch.mjs（2026-10-30 整合：Aave 事件增量+种子过滤）
 #   E. 研判兜底 arb_fallback.mjs（2026-10-30 整合：入队超 10 分钟未研判必提示）
+#   F. 快讯点火 news_ignite_watch.mjs（2026-10-30 整合：TG 公开源触发待核事件，
+#      脚本侧市场核查过升级门才入统一研判队列；新闻只点火、不定性）
 # 保活：cron sweep-loop-watchdog 每 1 小时检查本循环是否存活、且心跳是否新鲜，死了/卡了就拉起。
 # 日志：sweep_loop.log（超 5MB 自动只保留最后 3000 行）
 # review 记录（2026-10-04）：
@@ -88,6 +90,14 @@ while true; do
     if [ "$RC" -ne 0 ]; then
       log "arb_spread_watch 退出码 $RC（124=超时被杀）"
     fi
+    # C2. 冻结期跨所现货价差盯盘（2026-10-30 临时线，脚本内到期 2026-11-13 自停）：
+    # TRX/ETH 在 Binance/Gate/OKX/KuCoin 的中间价差 + $10k 盘口模拟，
+    # 可成交价差越线只入队深化、不直推；冻结场所腿在 factsText 标注 F7。
+    timeout 120 /usr/bin/node arb_cex_cross_watch.mjs >> "$LOG" 2>&1
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+      log "arb_cex_cross_watch 退出码 $RC（124=超时被杀）"
+    fi
     # D. 元套利地址跟踪（2026-10-30 整合）：Aave V3 Pool 五类事件按区块游标增量
     # 拉取，本地按种子地址库（arb_addresses.sqlite 中 watching）过滤；同一地址
     # 30 分钟累计借入 WETH/WBTC >$50 万或被清算 → 入队研判，小额只记库。
@@ -102,6 +112,14 @@ while true; do
     RC=$?
     if [ "$RC" -ne 0 ]; then
       log "arb_fallback 退出码 $RC（124=超时被杀）"
+    fi
+    # F. 快讯点火（2026-10-30 整合）：TG 公开源（PeckShield/Cyvers/吴说/Foresight/
+    # Odaily）关键词触发待核事件，脚本内节流 240 秒；过升级门（市场共现/双源确认+
+    # 状态证据/元地址异动）才入队，未过门只记日志、6 小时过期记档，永不直推。
+    timeout 120 /usr/bin/node news_ignite_watch.mjs >> "$LOG" 2>&1
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+      log "news_ignite_watch 退出码 $RC（124=超时被杀）"
     fi
     rmdir "$LOCKDIR"
     # R2: 一轮完整跑完才算心跳
