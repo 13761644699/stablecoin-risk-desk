@@ -8,6 +8,9 @@
 #   E. 研判兜底 arb_fallback.mjs（2026-10-30 整合：入队超 10 分钟未研判必提示）
 #   F. 快讯点火 news_ignite_watch.mjs（2026-10-30 整合：TG 公开源触发待核事件，
 #      脚本侧市场核查过升级门才入统一研判队列；新闻只点火、不定性）
+#   C3. 热钱包簇 inferred hotwallet_inferred_watch.mjs（2026-10-30 定案）：
+#      OKX/币安 ×TRON 簇出款流量状态机（判停/停后恢复）；TronGrid key
+#      未到位前模块未启用、每轮只打一行状态、不发任何请求。
 # 保活：cron sweep-loop-watchdog 每 1 小时检查本循环是否存活、且心跳是否新鲜，死了/卡了就拉起。
 # 日志：sweep_loop.log（超 5MB 自动只保留最后 3000 行）
 # review 记录（2026-10-04）：
@@ -91,12 +94,19 @@ while true; do
       log "arb_spread_watch 退出码 $RC（124=超时被杀）"
     fi
     # C2. 冻结期跨所现货价差盯盘（2026-10-30 临时线，脚本内到期 2026-11-13 自停）：
-    # TRX/ETH 在 Binance/Gate/OKX/KuCoin 的中间价差 + $10k 盘口模拟，
-    # 可成交价差越线只入队深化、不直推；冻结场所腿在 factsText 标注 F7。
+    # TRX/ETH 八家场所逐对中间价差 + $10k 盘口模拟（v2.4：价格指纹 +
+    # 未核实快速通道 + inferred 状态源），可成交价差越线只入队深化、不直推。
     timeout 120 /usr/bin/node arb_cex_cross_watch.mjs >> "$LOG" 2>&1
     RC=$?
     if [ "$RC" -ne 0 ]; then
       log "arb_cex_cross_watch 退出码 $RC（124=超时被杀）"
+    fi
+    # C3. 热钱包簇 inferred（2026-10-30 定案）：OKX/币安 ×TRON 簇出款状态机，
+    # 迁移才入队；未启用（TronGrid key 未到位）时脚本立即返回、只留一行状态。
+    timeout 90 /usr/bin/node hotwallet_inferred_watch.mjs >> "$LOG" 2>&1
+    RC=$?
+    if [ "$RC" -ne 0 ]; then
+      log "hotwallet_inferred_watch 退出码 $RC（124=超时被杀）"
     fi
     # D. 元套利地址跟踪（2026-10-30 整合）：Aave V3 Pool 五类事件按区块游标增量
     # 拉取，本地按种子地址库（arb_addresses.sqlite 中 watching）过滤；同一地址
